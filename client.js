@@ -352,6 +352,11 @@ window.__ModuleLoader__.load({
       return null
     }
 
+    /** The `@path` mention form the reference plugin understands (quoted when needed). */
+    function mentionOf(path) {
+      return /\s/.test(path) ? '@"' + path + '"' : '@' + path
+    }
+
     /** Payload for one pick; a kind with nothing to carry falls back to the element. */
     function buildPayload(kind, node, page) {
       if (kind === 'url') {
@@ -948,6 +953,10 @@ window.__ModuleLoader__.load({
         hovered = null
         stop()
         if (payload !== null) {
+          // Files already have a native reference (`ui-reference` turns `@path` into a
+          // real file chip with its own icon and preview), so hand that mention to the
+          // composer instead of inventing a second file chip.
+          if (payload.kind === 'file' && payload.path && commitReference(mentionOf(payload.path))) return
           const reference = fieldsOf(payload)
           payload.clipboard = reference
           if (commitChip(payload)) return
