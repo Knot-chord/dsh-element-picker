@@ -1042,9 +1042,11 @@ window.__ModuleLoader__.load({
 
       /** What else this hovered element can be referenced as, so the modifiers are visible. */
       function hoverExtras(node) {
+        if (isNativeReferenceControl(node)) return [t('hintNative')]
         const extras = []
         if (urlOf(node) !== null) extras.push(t('hintLink'))
-        if (pathOf(node) !== null) extras.push(t('hintFile'))
+        const file = pathOf(node)
+        if (file !== null) extras.push(t('hintFile') + ' ' + file.label.slice(0, 40))
         return extras
       }
 
@@ -1096,6 +1098,18 @@ window.__ModuleLoader__.load({
         return found
       }
 
+      /**
+       * DSH's own reference affordances (the `@文件` pill in a file row, `@` chips)
+       * already produce the official reference. While picking, let them through
+       * instead of swallowing the click and turning it into an element reference.
+       */
+      function isNativeReferenceControl(node) {
+        const control = node.closest ? node.closest('button, [role="button"]') : null
+        if (control === null) return false
+        const text = (control.textContent || '').trim()
+        return text.startsWith('@') && text.length <= 16
+      }
+
       function onMove(event, doc) {
         const next = targetOf(event, doc)
         if (next !== null && next.tagName === 'WEBVIEW') {
@@ -1110,6 +1124,7 @@ window.__ModuleLoader__.load({
       function onClick(event, doc) {
         const target = targetOf(event, doc)
         if (target === null) return
+        if (isNativeReferenceControl(target)) return
         event.preventDefault()
         event.stopPropagation()
         let payload = null
@@ -1504,6 +1519,7 @@ window.__ModuleLoader__.load({
                 hint: '点元素引用它；⌥ 点取链接、⇧ 点取文件路径；Esc 退出',
                 hintLink: '⌥ 链接',
                 hintFile: '⇧ 文件',
+                hintNative: '官方引用按钮，直接点',
                 noComposer: '没找到输入框 —— 先点一下输入框再试',
                 pickFailed: '这个元素取不到引用信息',
                 openedUrl: '已在侧栏打开这个链接',
@@ -1516,6 +1532,7 @@ window.__ModuleLoader__.load({
                 hint: 'Click an element; ⌥-click for its link, ⇧-click for its file path; Esc to exit',
                 hintLink: '⌥ link',
                 hintFile: '⇧ file',
+                hintNative: 'Native reference button — click it directly',
                 noComposer: 'No composer found — click the composer first',
                 pickFailed: 'Could not read this element',
                 openedUrl: 'Opened the link in the sidebar',
