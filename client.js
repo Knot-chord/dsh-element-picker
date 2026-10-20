@@ -587,7 +587,28 @@ window.__ModuleLoader__.load({
           if (selection === null || typeof selection.insertNodes !== 'function') {
             throw new Error('no composer selection')
           }
-          selection.insertNodes([node])
+          // The shipped insert path appends a space after the chip and leaves the
+          // caret past it; a chip butted against the caret is awkward to delete.
+          const nodes = editor._nodes
+          const textEntry = nodes instanceof Map ? nodes.get('text') : nodes ? nodes.text : null
+          const Text = textEntry && textEntry.klass
+          let space = null
+          try {
+            space = Text ? new Text(' ') : null
+          } catch (error) {
+            space = null
+          }
+          if (space !== null) {
+            selection.insertNodes([node, space])
+            try {
+              space.select(1, 1)
+            } catch (error) { /* caret placement is optional */ }
+          } else {
+            selection.insertNodes([node])
+            try {
+              if (typeof node.selectNext === 'function') node.selectNext(0, 0)
+            } catch (error) { /* caret placement is optional */ }
+          }
         })
         return true
       } catch (error) {
