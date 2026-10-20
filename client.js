@@ -495,6 +495,11 @@ window.__ModuleLoader__.load({
       return /\s/.test(path) ? '@"' + path + '"' : '@' + path
     }
 
+    function basenameOf(path) {
+      const parts = String(path).split(/[\\/]/u).filter(Boolean)
+      return parts.length > 0 ? parts[parts.length - 1] : String(path)
+    }
+
     /** Payload for one pick; a kind with nothing to carry falls back to the element. */
     function buildPayload(kind, node, page) {
       if (kind === 'url') {
@@ -568,20 +573,41 @@ window.__ModuleLoader__.load({
       const kind = kindOf(payload.kind)
       const refData = { ...payload, kind }
       delete refData.clipboard
+      /**
+       * Files go through DSH's own reference source: `ui-reference` registers
+       * `source: 'reference'` whose ref IS the `@path` mention, whose codec returns
+       * that mention to the model, and whose click opens the file preview. Taking
+       * that path means the chip is the shipped one, not a look-alike.
+       */
+      const officialFile = kind === 'file' && typeof payload.path === 'string' && payload.path !== ''
+      const mention = officialFile ? mentionOf(payload.path) : ''
       try {
         const root = document.querySelector('[contenteditable="true"]')
         if (root !== null && typeof root.focus === 'function') root.focus()
         editor.update(() => {
-          const node = Chip.importJSON({
-            type: 'reference-chip',
-            version: 1,
-            source: KINDS[kind].source,
-            ref: JSON.stringify(refData),
-            label: payload.label || '',
-            appearance: kind === 'file' ? 'file' : undefined,
-            clipboardText: payload.clipboard || fieldsOf({ ...payload, kind }),
-            invalid: false,
-          })
+          const node = Chip.importJSON(
+            officialFile
+              ? {
+                  type: 'reference-chip',
+                  version: 1,
+                  source: 'reference',
+                  ref: mention,
+                  label: mention ? basenameOf(payload.path) : payload.label || '',
+                  appearance: 'file',
+                  clipboardText: mention,
+                  invalid: false,
+                }
+              : {
+                  type: 'reference-chip',
+                  version: 1,
+                  source: KINDS[kind].source,
+                  ref: JSON.stringify(refData),
+                  label: payload.label || '',
+                  appearance: kind === 'file' ? 'file' : undefined,
+                  clipboardText: payload.clipboard || fieldsOf({ ...payload, kind }),
+                  invalid: false,
+                },
+          )
           const state = editor.getEditorState()
           const selection = state ? state._selection : null
           if (selection === null || typeof selection.insertNodes !== 'function') {
@@ -1158,13 +1184,11 @@ window.__ModuleLoader__.load({
         hovered = null
         stop()
         if (payload !== null) {
-          // Files already have a native reference (`ui-reference` turns `@path` into a
-          // real file chip with its own icon and preview), so hand that mention to the
-          // composer instead of inventing a second file chip.
-          if (payload.kind === 'file' && payload.path && commitReference(mentionOf(payload.path))) return
           const reference = fieldsOf(payload)
           payload.clipboard = reference
           if (commitChip(payload)) return
+          // No chip possible: a file still has its native text form.
+          if (payload.kind === 'file' && payload.path && commitReference(mentionOf(payload.path))) return
           if (commitReference(reference)) return
         }
         ensureUi()
