@@ -114,9 +114,11 @@ window.__ModuleLoader__.load({
     }
 
     function shortLabel(node) {
-      const classes = classesOf(node)
+      const classes = stableClasses(node)
       const base = node.tagName.toLowerCase() + (node.id ? '#' + node.id : '') + (classes.length ? '.' + classes[0] : '')
-      const text = ownText(node) || (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)
+      const alt = node.getAttribute && node.getAttribute('alt')
+      const text = ownText(node) || (typeof alt === 'string' && alt !== '' ? alt : '') ||
+        (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)
       return text ? base + ' · ' + text.slice(0, 32) : base
     }
 
@@ -214,6 +216,98 @@ window.__ModuleLoader__.load({
       return out
     }
 
+    /** CSS-module / hashed class names change on every build; never anchor on them. */
+    function isHashedName(name) {
+      return /^[A-Za-z0-9]{4,8}_/.test(name) || name.indexOf('__') !== -1
+    }
+
+    function stableClasses(node) {
+      return classesOf(node).filter((name) => !isHashedName(name)).slice(0, 2)
+    }
+
+    /** One path segment: id, else a stable attribute, else stable classes, else tag. */
+    function segmentFor(node, withIndex) {
+      if (!node || node.nodeType !== 1) return ''
+      const doc = docOf(node)
+      if (node.id) {
+        try {
+          if (doc.querySelectorAll('#' + CSS.escape(node.id)).length === 1) return '#' + CSS.escape(node.id)
+        } catch (error) { /* ignore */ }
+      }
+      let seg = node.tagName.toLowerCase()
+      for (const attr of ['data-testid', 'data-id', 'data-name', 'data-path', 'name']) {
+        const value = node.getAttribute(attr)
+        if (typeof value === 'string' && value !== '' && value.length <= 48) {
+          return seg + '[' + attr + '="' + value.replace(/"/g, '\\"') + '"]'
+        }
+      }
+      const classes = stableClasses(node)
+      if (classes.length > 0) seg += '.' + classes.map((name) => CSS.escape(name)).join('.')
+      if (withIndex) {
+        const parent = node.parentElement
+        if (parent) {
+          const same = Array.from(parent.children).filter((child) => child.tagName === node.tagName)
+          if (same.length > 1) seg += ':nth-of-type(' + (same.indexOf(node) + 1) + ')'
+        }
+      }
+      return seg
+    }
+
+    /**
+     * Ordered locators for one element: the shortest unique suffix built from stable
+     * segments first, then a full structural path (unique while the layout holds).
+     * Returns `{ primary, fallbacks }`; a click tries them in order.
+     */
+    function selectorsFor(node) {
+      const doc = docOf(node)
+      const list = []
+      const push = (selector) => {
+        if (typeof selector !== 'string' || selector === '' || list.indexOf(selector) !== -1) return
+        try {
+          if (doc.querySelectorAll(selector).length === 1) list.push(selector)
+        } catch (error) { /* invalid selector: skip */ }
+      }
+
+      if (node.id) push('#' + CSS.escape(node.id))
+
+      const suffix = []
+      let cur = node
+      while (cur && cur.nodeType === 1 && cur !== doc.documentElement) {
+        suffix.unshift(segmentFor(cur, false))
+        push(suffix.join(' > '))
+        cur = cur.parentElement
+      }
+
+      const structural = []
+      cur = node
+      while (cur && cur.nodeType === 1) {
+        structural.unshift(segmentFor(cur, true))
+        push(structural.join(' > '))
+        if (cur === doc.documentElement) break
+        cur = cur.parentElement
+      }
+
+      const primary = list.length > 0 ? list[0] : selectorFor(node)
+      return { primary, fallbacks: list.filter((item) => item !== primary) }
+    }
+
+    /** What an element points at: an image source, a link target, a file path. */
+    function resourceOf(node) {
+      const tag = node.tagName
+      const raw =
+        tag === 'IMG' || tag === 'VIDEO' || tag === 'SOURCE' || tag === 'AUDIO'
+          ? node.getAttribute('src') || node.getAttribute('poster') || ''
+          : tag === 'A' || tag === 'AREA'
+            ? node.getAttribute('href') || ''
+            : node.getAttribute('src') || ''
+      if (typeof raw !== 'string' || raw === '' || raw.startsWith('javascript:') || raw.startsWith('#')) return ''
+      try {
+        return new URL(raw, docOf(node).baseURI || location.href).href.slice(0, 200)
+      } catch (error) {
+        return raw.slice(0, 200)
+      }
+    }
+
     function visibleComposer() {
       const nodes = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
       const candidates = nodes.filter((node) => {
@@ -292,6 +386,7 @@ window.__ModuleLoader__.load({
       const lines = [KINDS[kind].prefix + ' ' + (payload.label || '')]
       if (kind === 'element') {
         if (payload.selector) lines.push('选择器: ' + payload.selector)
+        if (payload.resource) lines.push('资源: ' + payload.resource)
         if (payload.page) lines.push('页面: ' + payload.page)
         if (payload.frame) lines.push('框架: ' + payload.frame)
         if (payload.text) lines.push('文本: ' + payload.text)
@@ -327,7 +422,7 @@ window.__ModuleLoader__.load({
       return null
     }
 
-    /** Nearest ancestor carrying a filesystem path. */
+    /** Nearest ancestor carrying a filesystem path, then the owning component's props. */
     function pathOf(node) {
       let current = node
       for (let depth = 0; current && current.nodeType === 1 && depth < 4; depth += 1) {
@@ -349,6 +444,49 @@ window.__ModuleLoader__.load({
         }
         current = current.parentElement
       }
+      // File lists rarely put the path in the DOM; the row component's props have it.
+      const fromFiber = pathFromFiber(node)
+      if (fromFiber !== null) {
+        const parts = fromFiber.split(/[\\/]/u).filter(Boolean)
+        return { path: fromFiber, label: parts.length > 0 ? parts[parts.length - 1] : fromFiber }
+      }
+      return null
+    }
+
+    /** React fiber for one DOM node, if the node was rendered by React. */
+    function fiberOf(node) {
+      if (node === null || node.nodeType !== 1) return null
+      const key = Object.keys(node).find(
+        (name) => name.indexOf('__reactFiber$') === 0 || name.indexOf('__reactInternalInstance$') === 0,
+      )
+      return key === undefined ? null : node[key]
+    }
+
+    /**
+     * Walk the owning component's props for a filesystem path. File-tree rows hand
+     * their path down as a prop (`path` / `entry.path`), and the nearest ancestor
+     * carrying one is the row under the pointer.
+     */
+    function pathFromFiber(node) {
+      const looksLikePath = (value) => typeof value === 'string' && value !== '' && /[\\/]/.test(value)
+      let fiber = fiberOf(node)
+      for (let depth = 0; fiber && depth < 14; depth += 1) {
+        const props = fiber.memoizedProps
+        if (props && typeof props === 'object') {
+          for (const key of ['path', 'filePath', 'absPath', 'fullPath']) {
+            const value = props[key]
+            if (looksLikePath(value)) return value
+          }
+          const entry = props.entry || props.item || props.row
+          if (entry && typeof entry === 'object' && !entry.$$typeof) {
+            for (const key of ['path', 'filePath', 'absPath', 'fullPath']) {
+              const value = entry[key]
+              if (looksLikePath(value)) return value
+            }
+          }
+        }
+        fiber = fiber.return
+      }
       return null
     }
 
@@ -368,14 +506,19 @@ window.__ModuleLoader__.load({
         if (found !== null) return { kind: 'file', label: found.label, path: found.path }
       }
       const chain = framesOf(node)
-      const selector = selectorFor(node)
-      const full =
-        chain.length === 0 ? selector : chain.map((frame) => selectorFor(frame)).join(FRAME_SEP) + FRAME_SEP + selector
+      const info = selectorsFor(node)
+      const prefix = (selector) =>
+        chain.length === 0
+          ? selector
+          : chain.map((frame) => selectorFor(frame)).join(FRAME_SEP) + FRAME_SEP + selector
+      const fallbacks = info.fallbacks.map(prefix).filter((item) => item !== prefix(info.primary))
       const top = chain.length === 0 ? null : chain[chain.length - 1]
       return {
         kind: 'element',
         label: shortLabel(node),
-        selector: full,
+        selector: prefix(info.primary),
+        fallbacks,
+        resource: resourceOf(node),
         page: page || location.href,
         frame: top === null ? '' : top.getAttribute('src') || top.getAttribute('data-src') || '',
         text: ownText(node),
@@ -594,10 +737,9 @@ window.__ModuleLoader__.load({
       'setTimeout(function () { d.remove(); }, 1300); return "ok"; } catch (e) { return "err"; } })'
 
     /** Clicking a reference points back at what it names. */
-    function flashReference(payload) {
-      const raw = payload && payload.selector
-      if (typeof raw !== 'string' || raw === '') return false
-      const parts = raw.split(FRAME_SEP).map((part) => part.trim()).filter(Boolean)
+    /** `iframe-selector >>> inner-selector` — walk down frames, then flash inside. */
+    function flashCandidate(selector) {
+      const parts = selector.split(FRAME_SEP).map((part) => part.trim()).filter(Boolean)
       if (parts.length === 0) return false
       let doc = document
       for (let step = 0; step < parts.length - 1; step += 1) {
@@ -610,8 +752,25 @@ window.__ModuleLoader__.load({
         if (frame === null || frame.contentDocument == null) return false
         doc = frame.contentDocument
       }
-      const leaf = parts[parts.length - 1]
-      if (flashInDocument(doc, leaf)) return true
+      return flashInDocument(doc, parts[parts.length - 1])
+    }
+
+    /** Clicking a reference points back at what it names, trying every locator. */
+    function flashReference(payload) {
+      if (payload === null || typeof payload !== 'object') return false
+      const candidates = []
+      if (typeof payload.selector === 'string' && payload.selector !== '') candidates.push(payload.selector)
+      if (Array.isArray(payload.fallbacks)) {
+        for (const item of payload.fallbacks) {
+          if (typeof item === 'string' && item !== '' && candidates.indexOf(item) === -1) candidates.push(item)
+        }
+      }
+      for (const candidate of candidates) {
+        if (flashCandidate(candidate)) return true
+      }
+      // Same-origin lookup failed: the element may live inside a sidebar webview.
+      const leaf = candidates.length > 0 ? candidates[0].split(FRAME_SEP).pop().trim() : ''
+      if (leaf === '') return false
       const views = Array.from(document.querySelectorAll('webview')).filter(
         (node) => typeof node.executeJavaScript === 'function',
       )
@@ -696,7 +855,7 @@ window.__ModuleLoader__.load({
       id: 'element',
       order: 35,
       match(text, from) {
-        const pattern = /\[引用(元素|网址|文件)\][^\n]*(?:\n(?:选择器|页面|框架|文本|链接|路径):[^\n]*)*/gu
+        const pattern = /\[引用(元素|网址|文件)\][^\n]*(?:\n(?:选择器|资源|页面|框架|文本|链接|路径):[^\n]*)*/gu
         pattern.lastIndex = from
         const found = pattern.exec(text)
         if (found === null) return undefined
@@ -704,11 +863,12 @@ window.__ModuleLoader__.load({
         const kind = found[1] === '网址' ? 'url' : found[1] === '文件' ? 'file' : 'element'
         const lines = raw.split('\n')
         const label = lines[0].replace(/^\[引用(?:元素|网址|文件)\]\s*/u, '').trim()
-        const data = { kind, label, selector: '', page: '', frame: '', text: '', url: '', path: '', raw }
+        const data = { kind, label, selector: '', resource: '', page: '', frame: '', text: '', url: '', path: '', raw }
         for (const line of lines.slice(1)) {
-          const field = /^(选择器|页面|框架|文本|链接|路径):\s*(.*)$/u.exec(line)
+          const field = /^(选择器|资源|页面|框架|文本|链接|路径):\s*(.*)$/u.exec(line)
           if (field === null) continue
           if (field[1] === '选择器') data.selector = field[2]
+          else if (field[1] === '资源') data.resource = field[2]
           else if (field[1] === '页面') data.page = field[2]
           else if (field[1] === '框架') data.frame = field[2]
           else if (field[1] === '文本') data.text = field[2]
@@ -880,6 +1040,14 @@ window.__ModuleLoader__.load({
         document.body.appendChild(tip)
       }
 
+      /** What else this hovered element can be referenced as, so the modifiers are visible. */
+      function hoverExtras(node) {
+        const extras = []
+        if (urlOf(node) !== null) extras.push(t('hintLink'))
+        if (pathOf(node) !== null) extras.push(t('hintFile'))
+        return extras
+      }
+
       function paint(node) {
         if (node === null) {
           box.style.display = 'none'
@@ -893,7 +1061,8 @@ window.__ModuleLoader__.load({
         box.style.height = rect.height + 'px'
         box.style.display = 'block'
         if (warnTimer !== 0) return
-        tip.textContent = labelOf(node)
+        const extras = hoverExtras(node)
+        tip.textContent = labelOf(node) + (extras.length > 0 ? '   ' + extras.join('  ') : '')
         delete tip.dataset.warn
         tip.style.left = Math.max(6, Math.min(rect.x, window.innerWidth - 320)) + 'px'
         tip.style.top = Math.max(6, rect.y - 22) + 'px'
@@ -1333,6 +1502,8 @@ window.__ModuleLoader__.load({
                 btn: '引用：点一下开始选取（Esc 退出）',
                 btnOn: '引用：选取中，点一下停止',
                 hint: '点元素引用它；⌥ 点取链接、⇧ 点取文件路径；Esc 退出',
+                hintLink: '⌥ 链接',
+                hintFile: '⇧ 文件',
                 noComposer: '没找到输入框 —— 先点一下输入框再试',
                 pickFailed: '这个元素取不到引用信息',
                 openedUrl: '已在侧栏打开这个链接',
@@ -1343,6 +1514,8 @@ window.__ModuleLoader__.load({
                 btn: 'Reference: click to start picking (Esc to exit)',
                 btnOn: 'Reference: picking — click to stop',
                 hint: 'Click an element; ⌥-click for its link, ⇧-click for its file path; Esc to exit',
+                hintLink: '⌥ link',
+                hintFile: '⇧ file',
                 noComposer: 'No composer found — click the composer first',
                 pickFailed: 'Could not read this element',
                 openedUrl: 'Opened the link in the sidebar',
