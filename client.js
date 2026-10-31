@@ -1444,7 +1444,7 @@ window.__ModuleLoader__.load({
     function createStripButton(t, picker) {
       let observer = null
       let interval = 0
-      let frame = 0
+      let timer = 0
 
       /** Several session surfaces live in the DOM at once; only one is painted. */
       function isVisible(node) {
@@ -1498,7 +1498,7 @@ window.__ModuleLoader__.load({
       }
 
       function sync() {
-        frame = 0
+        timer = 0
         const place = locate()
         const existing = document.getElementById(BUTTON_ID)
 
