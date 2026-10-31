@@ -1087,9 +1087,26 @@ window.__ModuleLoader__.load({
         document.body.appendChild(tip)
       }
 
+      /**
+       * A preview frame the picker cannot enter: better-sidebar renders HTML
+       * previews (and sandboxed web pages) in an iframe WITHOUT `allow-same-origin`,
+       * so the frame gets an opaque origin and `contentDocument` is unreachable.
+       */
+      function blockedFrameOf(node) {
+        if (node === null || node.nodeType !== 1) return null
+        const tag = node.tagName
+        if (tag !== 'IFRAME' && tag !== 'FRAME') return null
+        try {
+          return node.contentDocument === null ? node : null
+        } catch (error) {
+          return node
+        }
+      }
+
       /** What else this hovered element can be referenced as, so the modifiers are visible. */
       function hoverExtras(node) {
         if (isNativeReferenceControl(node)) return [t('hintNative')]
+        if (blockedFrameOf(node) !== null) return [t('sandboxed')]
         const extras = []
         if (urlOf(node) !== null) extras.push(t('hintLink'))
         const file = pathOf(node)
@@ -1174,6 +1191,13 @@ window.__ModuleLoader__.load({
         if (isNativeReferenceControl(target)) return
         event.preventDefault()
         event.stopPropagation()
+        // A sandboxed preview keeps its DOM on an opaque origin: nothing can be
+        // read inside it, so say what to switch instead of picking the frame.
+        if (blockedFrameOf(target) !== null) {
+          ensureUi()
+          warn(t('sandboxedHint'))
+          return
+        }
         let payload = null
         try {
           const wanted = event.altKey ? 'url' : event.shiftKey ? 'file' : 'element'
@@ -1505,9 +1529,17 @@ window.__ModuleLoader__.load({
         paint()
       }
 
+      /**
+       * The strip re-renders on React updates and the document mutates on every
+       * streamed token, so coalesce instead of re-placing the button per animation
+       * frame: at most one placement pass every 200 ms while a reply is streaming.
+       */
       function schedule() {
-        if (frame !== 0) return
-        frame = typeof requestAnimationFrame === 'function' ? requestAnimationFrame(sync) : setTimeout(sync, 16)
+        if (timer !== 0) return
+        timer = setTimeout(() => {
+          timer = 0
+          sync()
+        }, 200)
       }
 
       function start() {
@@ -1525,6 +1557,8 @@ window.__ModuleLoader__.load({
       function destroy() {
         if (observer !== null) observer.disconnect()
         observer = null
+        clearTimeout(timer)
+        timer = 0
         clearInterval(interval)
         interval = 0
         window.removeEventListener('resize', schedule)
@@ -1565,6 +1599,8 @@ window.__ModuleLoader__.load({
                 hintLink: '⌥ 链接',
                 hintFile: '⇧ 文件',
                 hintNative: '官方引用按钮，直接点',
+                sandboxed: '⚠ 沙箱预览，内部取不到',
+                sandboxedHint: '这个预览跑在沙箱里（跨源隔离），先点预览工具栏的「临时解锁」再选',
                 noComposer: '没找到输入框 —— 先点一下输入框再试',
                 pickFailed: '这个元素取不到引用信息',
                 openedUrl: '已在侧栏打开这个链接',
@@ -1578,6 +1614,8 @@ window.__ModuleLoader__.load({
                 hintLink: '⌥ link',
                 hintFile: '⇧ file',
                 hintNative: 'Native reference button — click it directly',
+                sandboxed: '⚠ sandboxed preview — its DOM is not reachable',
+                sandboxedHint: 'This preview runs sandboxed (opaque origin). Click “Temporarily disable” in the preview toolbar, then pick again.',
                 noComposer: 'No composer found — click the composer first',
                 pickFailed: 'Could not read this element',
                 openedUrl: 'Opened the link in the sidebar',
@@ -1671,6 +1709,9 @@ window.__ModuleLoader__.load({
           },
           'dsh-element-picker: teardown',
         )
+        // Interop hook for addon plugins (model picker and friends): expose the
+        // same insertion path the picker uses internally.
+        window.__dshElementPicker = { commitChip, commitReference }
         strip.start()
         patchChipDecorate()
       },
