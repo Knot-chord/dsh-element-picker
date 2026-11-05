@@ -131,6 +131,7 @@ export function apply(ctx, config = {}) {
       }
       health.helper = true
       health.startedAt = Date.now()
+      child.unref()
       child.stdout?.on('data', () => {})
       child.stderr?.on('data', (chunk) => {
         health.error = String(chunk).trim().slice(0, 200)
@@ -148,12 +149,17 @@ export function apply(ctx, config = {}) {
       stopped = true
       if (restart !== null) clearTimeout(restart)
       if (child !== null) {
+        const dying = child
+        child = null
+        // Close the pipes first: killing a child whose stdio handles are still open
+        // during host shutdown trips libuv's assertion on Windows.
         try {
-          child.kill()
+          dying.stdout?.destroy()
+          dying.stderr?.destroy()
+          dying.kill()
         } catch (error) {
           /* already gone */
         }
-        child = null
       }
       health.helper = false
     }
