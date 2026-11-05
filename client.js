@@ -386,8 +386,23 @@ window.__ModuleLoader__.load({
       const lines = [KINDS[kind].prefix + ' ' + (payload.label || '')]
       if (kind === 'element') {
         if (payload.selector) lines.push('选择器: ' + payload.selector)
+        if (payload.os) {
+          // An element outside DSH: describe the window and the control instead of
+          // a CSS selector, which does not exist there.
+          if (payload.os.window) lines.push('窗口: ' + payload.os.window)
+          const control = [payload.os.controlType, payload.os.name].filter(Boolean).join(' · ')
+          if (control) lines.push('控件: ' + control)
+          const locator = [payload.os.automationId ? 'AutomationId=' + payload.os.automationId : '', payload.os.className ? 'Class=' + payload.os.className : '']
+            .filter(Boolean)
+            .join(' ')
+          if (locator) lines.push('定位: ' + locator)
+          if (payload.os.bounds) {
+            const box = payload.os.bounds
+            lines.push('位置: ' + [box.x, box.y].join(',') + ' ' + [box.w, box.h].join('×'))
+          }
+        }
         if (payload.resource) lines.push('资源: ' + payload.resource)
-        if (payload.page) lines.push('页面: ' + payload.page)
+        if (payload.page && !payload.os) lines.push('页面: ' + payload.page)
         if (payload.frame) lines.push('框架: ' + payload.frame)
         if (payload.text) lines.push('文本: ' + payload.text)
       } else if (kind === 'url') {
@@ -902,7 +917,7 @@ window.__ModuleLoader__.load({
       id: 'element',
       order: 35,
       match(text, from) {
-        const pattern = /\[引用(元素|网址|文件)\][^\n]*(?:\n(?:选择器|资源|页面|框架|文本|链接|路径):[^\n]*)*/gu
+        const pattern = /\[引用(元素|网址|文件)\][^\n]*(?:\n(?:选择器|资源|窗口|控件|定位|位置|页面|框架|文本|链接|路径):[^\n]*)*/gu
         pattern.lastIndex = from
         const found = pattern.exec(text)
         if (found === null) return undefined
@@ -911,17 +926,23 @@ window.__ModuleLoader__.load({
         const lines = raw.split('\n')
         const label = lines[0].replace(/^\[引用(?:元素|网址|文件)\]\s*/u, '').trim()
         const data = { kind, label, selector: '', resource: '', page: '', frame: '', text: '', url: '', path: '', raw }
+        const os = { window: '', control: '', locator: '', box: '' }
         for (const line of lines.slice(1)) {
-          const field = /^(选择器|资源|页面|框架|文本|链接|路径):\s*(.*)$/u.exec(line)
+          const field = /^(选择器|资源|窗口|控件|定位|位置|页面|框架|文本|链接|路径):\s*(.*)$/u.exec(line)
           if (field === null) continue
           if (field[1] === '选择器') data.selector = field[2]
           else if (field[1] === '资源') data.resource = field[2]
+          else if (field[1] === '窗口') os.window = field[2]
+          else if (field[1] === '控件') os.control = field[2]
+          else if (field[1] === '定位') os.locator = field[2]
+          else if (field[1] === '位置') os.box = field[2]
           else if (field[1] === '页面') data.page = field[2]
           else if (field[1] === '框架') data.frame = field[2]
           else if (field[1] === '文本') data.text = field[2]
           else if (field[1] === '链接') data.url = field[2]
           else data.path = field[2]
         }
+        if (os.window !== '' || os.control !== '') data.os = os
         return { id: 'element', start: found.index, end: found.index + raw.length, data }
       },
     }
@@ -1488,13 +1509,23 @@ window.__ModuleLoader__.load({
         return null
       }
 
+      let hotkey = ''
+
       function paint() {
         const button = document.getElementById(BUTTON_ID)
         if (button === null) return
         if (picker.isActive()) button.dataset.on = '1'
         else delete button.dataset.on
-        button.title = picker.isActive() ? t('btnOn') : t('btn')
-        button.setAttribute('aria-label', t('btn'))
+        const base = picker.isActive() ? t('btnOn') : t('btn')
+        const title = hotkey === '' ? base : base + ' · ' + t('osHint').replace('{hotkey}', hotkey)
+        button.title = title
+        button.setAttribute('aria-label', title)
+      }
+
+      function setHotkey(value) {
+        if (typeof value !== 'string' || value === hotkey) return
+        hotkey = value
+        paint()
       }
 
       function sync() {
@@ -1566,7 +1597,7 @@ window.__ModuleLoader__.load({
         if (existing !== null && existing.parentNode) existing.parentNode.removeChild(existing)
       }
 
-      return { start, destroy, paint }
+      return { start, destroy, paint, setHotkey }
     }
 
     /* ------------------------------------------------------------------ app */
@@ -1606,6 +1637,8 @@ window.__ModuleLoader__.load({
                 openedUrl: '已在侧栏打开这个链接',
                 copiedUrl: '链接已复制',
                 copiedPath: '路径已复制',
+                osPicked: '已引用外部控件：{label}',
+                osHint: '外部窗口 {hotkey}',
               },
               en: {
                 btn: 'Reference: click to start picking (Esc to exit)',
@@ -1621,6 +1654,8 @@ window.__ModuleLoader__.load({
                 openedUrl: 'Opened the link in the sidebar',
                 copiedUrl: 'Link copied',
                 copiedPath: 'Path copied',
+                osPicked: 'Referenced external control: {label}',
+                osHint: 'outside window: {hotkey}',
               },
             }),
           'dsh-element-picker: dictionaries',
@@ -1714,6 +1749,62 @@ window.__ModuleLoader__.load({
         window.__dshElementPicker = { commitChip, commitReference }
         strip.start()
         patchChipDecorate()
+
+        // Elements outside DSH: the native helper posts what sits under the mouse
+        // when the global hotkey fires, and this loop turns it into a chip.
+        let osRevision = 0
+        let osTimer = 0
+        let osBusy = false
+        const pollOsPick = async () => {
+          if (osBusy) return
+          osBusy = true
+          try {
+            const response = await fetch('/element-picker/os/state?since=' + String(osRevision), {
+              cache: 'no-store',
+            })
+            if (!response.ok) return
+            const state = await response.json()
+            if (typeof state.revision === 'number') osRevision = Math.max(osRevision, state.revision)
+            if (typeof state.hotkey === 'string') strip.setHotkey(state.hotkey)
+            const pick = state.pick
+            if (pick === null || pick === undefined) return
+            const control = [pick.controlType, pick.name].filter(Boolean).join(' · ')
+            const label = (pick.windowOnly === true ? pick.windowTitle || control : control || pick.windowTitle || '')
+              .trim()
+              .slice(0, 60)
+            if (label === '') return
+            const payload = {
+              kind: 'element',
+              label,
+              selector: '',
+              page: '',
+              text: pick.text || pick.name || '',
+              os: {
+                window: [pick.processName, pick.windowTitle].filter(Boolean).join(' — ').slice(0, 160),
+                controlType: pick.controlType || '',
+                name: (pick.name || '').slice(0, 120),
+                automationId: pick.automationId || '',
+                className: pick.className || '',
+                bounds: pick.bounds || null,
+                windowOnly: pick.windowOnly === true,
+              },
+            }
+            if (!commitChip(payload)) commitReference(fieldsOf(payload))
+            toast(t('osPicked').replace('{label}', label))
+          } catch (error) {
+            /* the host half may not be mounted yet */
+          } finally {
+            osBusy = false
+          }
+        }
+        osTimer = setInterval(pollOsPick, 1200)
+        ctx.effect(
+          () => () => {
+            clearInterval(osTimer)
+            osTimer = 0
+          },
+          'dsh-element-picker: OS pick polling',
+        )
       },
     }
   },
