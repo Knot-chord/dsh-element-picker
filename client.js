@@ -1988,7 +1988,7 @@ window.__ModuleLoader__.load({
               if (state.revision < osRevision) osRevision = 0
               osRevision = Math.max(osRevision, state.revision)
             }
-            if (typeof state.hotkey === 'string') strip.setHotkey(state.hotkey)
+            if (typeof state.hotkey === 'string') strip.setHotkey(state.external === true ? state.hotkey : '')
             const pick = state.pick
             if (pick === null || pick === undefined) return
             // A provider decides the kind; the chip follows it. `file` and `url` picks

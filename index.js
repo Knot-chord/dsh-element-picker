@@ -58,6 +58,9 @@ async function readJson(req) {
  */
 export function apply(ctx, config = {}) {
   const enabled = config.enabled !== false
+  // Outside-DSH picking is opt-in: the platform ceiling (Chromium exposes only the
+  // window without a debug port) made it unreliable, so the default stays in-app only.
+  const external = config.external === true
   const hotkey = typeof config.hotkey === 'string' && config.hotkey !== '' ? config.hotkey : 'Ctrl+Alt+P'
   const language = config.language === 'en' ? 'en' : 'zh'
 
@@ -187,6 +190,7 @@ export function apply(ctx, config = {}) {
           error: health.error,
           polls: health.polls,
           clientFocused: ui.focused,
+          external,
           pick: fresh ? state.pick : null,
         })
         return
@@ -242,7 +246,7 @@ export function apply(ctx, config = {}) {
   )
 
   ctx.effect(() => {
-    if (!enabled) return () => {}
+    if (!enabled || !external) return () => {}
     const script = join(dirname(fileURLToPath(import.meta.url)), 'native', 'os-pick.ps1')
     if (!existsSync(script)) {
       health.error = 'native/os-pick.ps1 missing'
