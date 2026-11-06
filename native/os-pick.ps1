@@ -81,6 +81,7 @@ public static class OsPickWin32 {
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
     [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int max);
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
 
     [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder name, int max);
@@ -92,6 +93,11 @@ public static class OsPickWin32 {
         var buffer = new System.Text.StringBuilder(256);
         GetClassName(hWnd, buffer, buffer.Capacity);
         return buffer.ToString();
+    }
+    public static int ProcessIdOf(IntPtr hWnd) {
+        uint pid;
+        GetWindowThreadProcessId(hWnd, out pid);
+        return (int)pid;
     }
     // Chromium keeps its accessibility tree off until a client asks for the window's
     // accessible object; this message is that ask.
@@ -288,15 +294,15 @@ function Get-WindowTitle([IntPtr]$handle) {
     return $buffer.ToString()
 }
 
-# Ask the host to pick inside the matching browser tab over the DevTools protocol.
-function Try-CdpPick([string]$windowTitle) {
+# Ask the host to resolve this click through its provider/output engine.
+function Try-Resolve($point, $window) {
     try {
-        $payload = ConvertTo-Json @{ windowTitle = $windowTitle }
+        $payload = ConvertTo-Json @{ point = $point; window = $window } -Depth 5
         $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
-        $uri = ($BaseUrl.TrimEnd('/')) + '/element-picker/os/cdp/pick'
-        return Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 100
+        $uri = ($BaseUrl.TrimEnd('/')) + '/element-picker/os/resolve'
+        return Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 120
     } catch {
-        return @{ ok = $false; reason = 'cdp-request-failed' }
+        return @{ ok = $false; reason = 'resolve-request-failed' }
     }
 }
 
@@ -405,17 +411,25 @@ function Start-Selection {
                 # debugging port, hand the pick to the tab and let it resolve there.
                 $root = Get-RootWindow $cursor.x $cursor.y
                 $rootClass = if ($null -ne $root) { [OsPickWin32]::ClassOf($root) } else { '' }
-                if ($rootClass -match 'Chrome_WidgetWin') {
-                    $title = Get-WindowTitle $root
-                    $cdp = Try-CdpPick $title
-                    if ($cdp -and $cdp.ok -eq $true) {
-                        $script:lastCdpReason = ''
-                        $result = @{ cdp = $true }
-                        break
-                    }
-                    $script:lastCdpReason = if ($cdp) { [string]$cdp.reason } else { 'no-response' }
-                }
+                $rootTitle = if ($null -ne $root) { Get-WindowTitle $root } else { '' }
+                $rootPid = if ($null -ne $root) { [OsPickWin32]::ProcessIdOf($root) } else { 0 }
+                $rootProcess = if ($rootPid -gt 0) { $p = Get-Process -Id $rootPid -ErrorAction SilentlyContinue; if ($p) { $p.ProcessName } else { '' } } else { '' }
 
+                # The host owns the decision: providers (browser/CDP, desktop wallpaper,
+                # UI Automation, user modules) resolve the point, outputs deliver it.
+                $resolved = Try-Resolve @{ x = $cursor.x; y = $cursor.y } @{
+                    class = $rootClass
+                    title = $rootTitle
+                    processId = $rootPid
+                    processName = $rootProcess
+                }
+                if ($resolved -and $resolved.ok -eq $true) {
+                    $result = @{ handoff = $true; provider = $resolved.provider; output = $resolved.output }
+                    break
+                }
+                $script:lastResolveReason = if ($resolved) { [string]$resolved.reason } else { 'host-unreachable' }
+
+                # Fallback: resolve locally so a host that is not mounted yet still works.
                 $result = Get-Pick $cursor.x $cursor.y
             }
             break

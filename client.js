@@ -1785,9 +1785,25 @@ window.__ModuleLoader__.load({
             if (typeof state.hotkey === 'string') strip.setHotkey(state.hotkey)
             const pick = state.pick
             if (pick === null || pick === undefined) return
-            if (pick.cdp === true) {
-              // A browser tab answered over the DevTools protocol: this is a real DOM
-              // element, so it carries a selector and a page just like an in-app pick.
+            // A provider decides the kind; the chip follows it. `file` and `url` picks
+            // reuse the native reference paths already implemented above.
+            if (pick.kind === 'file' && typeof pick.path === 'string' && pick.path !== '') {
+              const fileLabel = String(pick.label || basenameOf(pick.path)).trim().slice(0, 60)
+              const filePayload = { kind: 'file', label: fileLabel, path: pick.path }
+              if (!commitChip(filePayload)) commitReference(mentionOf(pick.path))
+              toast(t('osPicked').replace('{label}', fileLabel))
+              return
+            }
+            if (pick.kind === 'url' && typeof pick.url === 'string' && pick.url !== '') {
+              const urlLabel = String(pick.label || pick.url).trim().slice(0, 60)
+              const urlPayload = { kind: 'url', label: urlLabel, url: pick.url }
+              if (!commitChip(urlPayload)) commitReference(fieldsOf(urlPayload))
+              toast(t('osPicked').replace('{label}', urlLabel))
+              return
+            }
+            if (pick.cdp === true || pick.provider === 'browser-cdp' || pick.selector) {
+              // A browser tab answered over the DevTools protocol (or a user provider
+              // returned a real selector): this is a DOM element like an in-app pick.
               const domLabel = String(pick.label || pick.text || '').trim().slice(0, 60)
               if (domLabel === '') return
               const domPayload = {

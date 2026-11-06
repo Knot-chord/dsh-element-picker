@@ -11,6 +11,7 @@ import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { findDebugPort, listTargets, pickInBrowser } from './cdp.js'
+import { createEngine, formatPick, userDirs } from './protocols.js'
 
 export const name = 'element-picker'
 export const inject = ['webServer']
@@ -67,6 +68,20 @@ export function apply(ctx, config = {}) {
   const generation = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   /** @type {{ revision: number, pick: object | null }} */
   const state = { revision: 0, pick: null }
+
+  // Providers decide what a click means; outputs decide where the pick goes. Both are
+  // user-extensible, so nothing downstream assumes a specific source.
+  const engine = createEngine({
+    home: process.env.DSH_HOME,
+    inputs: Array.isArray(config.inputs) ? config.inputs : undefined,
+    outputs: Array.isArray(config.outputs) ? config.outputs : undefined,
+    onPick: (pick) => {
+      state.pick = { ...pick, receivedAt: Date.now() }
+      state.revision += 1
+      health.error = ''
+    },
+  })
+  void engine.reload()
   const health = { helper: false, error: '', hotkey, startedAt: 0, polls: 0 }
 
   const handler = async (req, res) => {
@@ -132,6 +147,28 @@ export function apply(ctx, config = {}) {
           polls: health.polls,
           pick: fresh ? state.pick : null,
         })
+        return
+      }
+
+      if (url.pathname === `${ROUTE}/resolve` && req.method === 'POST') {
+        const body = await readJson(req)
+        const point = body.point ?? { x: 0, y: 0 }
+        const outcome = await engine.resolve({
+          point: { x: Number(point.x) || 0, y: Number(point.y) || 0 },
+          window: body.window ?? {},
+          hotkey,
+        })
+        sendJson(res, 200, outcome)
+        return
+      }
+
+      if (url.pathname === `${ROUTE}/protocols` && req.method === 'GET') {
+        sendJson(res, 200, engine.describe())
+        return
+      }
+
+      if (url.pathname === `${ROUTE}/protocols/reload` && req.method === 'POST') {
+        sendJson(res, 200, await engine.reload())
         return
       }
 
