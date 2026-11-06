@@ -100,6 +100,61 @@ config:
 
 去掉 `.example` 后缀即生效。它们演示了两件用户常提的事：**不把桌面当元素而是读壁纸图片**、**选完不进 DSH 而是进剪贴板**。
 
+## 给插件用：`ctx.elementPicker`（宿主内 API）
+
+别的插件不用写文件，直接注册即可：
+
+```js
+export const inject = ['elementPicker']
+
+export function apply(ctx) {
+  const off = ctx.elementPicker.registerProvider({
+    id: 'my-cdp-bridge',
+    priority: 120,
+    match: (context) => context.window?.class?.startsWith('Chrome_WidgetWin'),
+    async pick(context) {
+      // ctx.elementPicker.helpers 里已经有内置的 CDP 客户端和 PowerShell 运行器
+      const outcome = await ctx.elementPicker.helpers.cdp.pickInBrowser({
+        windowTitle: context.window.title,
+      })
+      if (!outcome.ok) return null
+      return { kind: 'element', label: outcome.pick.label, selector: outcome.pick.selector, page: outcome.pick.page }
+    },
+  })
+  ctx.effect(() => off, 'my-plugin: provider')
+}
+```
+
+输出同理：`registerOutput({ id, priority, accept, deliver })`。
+
+外部工具（进程、脚本、另一个应用）不用写插件，直接打 HTTP：
+
+```bash
+# 把一次选取塞进 DSH（会变成引用 chip）
+curl -X POST http://127.0.0.1:<port>/element-picker/os/pick \
+     -H 'content-type: application/json' \
+     -d '{"kind":"element","label":"按钮 · 保存","selector":"#save","page":"https://…","text":"保存"}'
+
+# 让插件替你解析一个坐标
+curl -X POST http://127.0.0.1:<port>/element-picker/os/resolve \
+     -H 'content-type: application/json' \
+     -d '{"point":{"x":900,"y":600},"window":{"class":"Chrome_WidgetWin_1","title":"…"}}'
+```
+
+服务接口一览：
+
+| 方法 | 作用 |
+|---|---|
+| `registerProvider(def)` | 注册解析协议，返回注销函数 |
+| `registerOutput(def)` | 注册投递协议，返回注销函数 |
+| `resolve(context)` | 手动跑一次解析+投递 |
+| `pushPick(pick)` | 直接把结果送进选取队列（等价于 HTTP `/pick`） |
+| `describe()` | 当前注册表 |
+| `reload()` | 重扫用户目录 |
+| `helpers` | `{ cdp: { pickInBrowser, findDebugPort }, runPowerShell, formatPick }` |
+
+事件：每次有结果会发 `ctx.on('element-picker/pick', (pick) => …)`。
+
 ## 诊断
 
 ```

@@ -79,9 +79,36 @@ export function apply(ctx, config = {}) {
       state.pick = { ...pick, receivedAt: Date.now() }
       state.revision += 1
       health.error = ''
+      try {
+        ctx.emit('element-picker/pick', pick)
+      } catch (error) {
+        /* no listener is fine */
+      }
     },
   })
   void engine.reload()
+
+  // Public surface for other plugins: they can add providers/outputs at runtime or
+  // feed picks from their own integrations (a CDP bridge, an editor plugin, …).
+  const api = {
+    registerProvider: engine.registerProvider,
+    registerOutput: engine.registerOutput,
+    resolve: engine.resolve,
+    pushPick: engine.pushPick,
+    describe: engine.describe,
+    reload: engine.reload,
+    formatPick: engine.formatPick,
+    helpers: engine.helpers,
+  }
+  try {
+    ctx.provide('elementPicker', api)
+  } catch (error) {
+    try {
+      ctx.set?.('elementPicker', api)
+    } catch (inner) {
+      health.error = 'elementPicker service unavailable: ' + String(error).slice(0, 120)
+    }
+  }
   const health = { helper: false, error: '', hotkey, startedAt: 0, polls: 0 }
 
   const handler = async (req, res) => {

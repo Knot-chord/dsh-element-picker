@@ -270,6 +270,12 @@ const clipboardOutput = {
   },
 }
 
+const helpers = {
+  cdp: { pickInBrowser, findDebugPort },
+  runPowerShell,
+  formatPick,
+}
+
 async function importUserModule(file) {
   const url = pathToFileURL(file).href + '?v=' + statSync(file).mtimeMs
   const loaded = await import(url)
@@ -286,9 +292,14 @@ export function createEngine(options) {
   const home = options.home
   const dirs = ensureUserDirs(home)
   const builtins = [cdpProvider, desktopWallpaperProvider, uiaProvider]
+  /** Providers/outputs registered by other plugins at runtime. */
+  const runtimeProviders = new Map()
+  const runtimeOutputs = new Map()
   const builtinOutputs = [composerOutput(options.onPick), clipboardOutput]
   let providers = [...builtins]
   let outputs = [...builtinOutputs]
+  let baseProviders = [...builtins]
+  let baseOutputs = [...builtinOutputs]
   let loadErrors = []
   let generation = 0
 
@@ -348,8 +359,19 @@ export function createEngine(options) {
       const chosen = allOutputs.filter((entry) => selectedOutputs.includes(entry.id))
       allOutputs = chosen.length > 0 ? chosen : allOutputs
     }
-    providers = allProviders.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
-    outputs = allOutputs.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
+    baseProviders = allProviders
+    baseOutputs = allOutputs
+    rebuild()
+  }
+
+  /** Merge built-in/user/system layers with runtime registrations, then sort. */
+  function rebuild() {
+    providers = [...baseProviders, ...runtimeProviders.values()].sort(
+      (a, b) => (b.priority ?? 0) - (a.priority ?? 0),
+    )
+    outputs = [...baseOutputs, ...runtimeOutputs.values()].sort(
+      (a, b) => (b.priority ?? 0) - (a.priority ?? 0),
+    )
     generation += 1
   }
 
@@ -381,7 +403,9 @@ export function createEngine(options) {
   }
 
   /** Resolve one context, then let the first output that accepts it deliver. */
-  async function resolve(ctx) {
+  async function resolve(rawContext) {
+    // User protocols get the same building blocks the built-ins use.
+    const ctx = { ...rawContext, helpers }
     for (const provider of providers) {
       let applies = false
       try {
@@ -414,5 +438,45 @@ export function createEngine(options) {
     return { ok: false, reason: 'no-provider' }
   }
 
-  return { reload, describe, resolve, dirs }
+  function registerProvider(definition) {
+    if (definition === null || typeof definition !== 'object' || typeof definition.id !== 'string') {
+      throw new Error('provider needs an id')
+    }
+    if (typeof definition.match !== 'function' || typeof definition.pick !== 'function') {
+      throw new Error('provider needs match() and pick()')
+    }
+    runtimeProviders.set(definition.id, { ...definition, origin: 'plugin', kind: 'provider' })
+    rebuild()
+    return () => {
+      runtimeProviders.delete(definition.id)
+      rebuild()
+    }
+  }
+
+  function registerOutput(definition) {
+    if (definition === null || typeof definition !== 'object' || typeof definition.id !== 'string') {
+      throw new Error('output needs an id')
+    }
+    if (typeof definition.deliver !== 'function') {
+      throw new Error('output needs deliver()')
+    }
+    runtimeOutputs.set(definition.id, { ...definition, origin: 'plugin', kind: 'output' })
+    rebuild()
+    return () => {
+      runtimeOutputs.delete(definition.id)
+      rebuild()
+    }
+  }
+
+  return {
+    reload,
+    describe,
+    resolve,
+    dirs,
+    registerProvider,
+    registerOutput,
+    pushPick: (pick) => options.onPick(pick),
+    formatPick,
+    helpers,
+  }
 }
