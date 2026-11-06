@@ -1,30 +1,123 @@
 param(
     [string]$BaseUrl = 'http://127.0.0.1:5000',
     [string]$Hotkey = 'Ctrl+Alt+P',
-    [int]$PollMs = 40,
+    [int]$PollMs = 35,
     [switch]$Once,
-    [switch]$PostOnce
+    [switch]$PostOnce,
+    [switch]$Select
 )
 
-# os-pick.ps1 - read the UI Automation element under the mouse pointer and POST it
-# to the DSH host half. Pure ASCII on purpose: Windows PowerShell 5.1 reads a
-# BOM-less file as ANSI, so any non-ASCII literal would be mangled.
+# os-pick.ps1 - press the hotkey to enter selection mode: move the pointer to see the
+# element under it outlined, click to send it to the DSH host half; right click or Esc
+# cancels. Pure ASCII on purpose (Windows PowerShell 5.1 reads a BOM-less file as ANSI).
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
 Add-Type -AssemblyName WindowsBase
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName UIAutomationClient
 Add-Type -AssemblyName UIAutomationTypes
 
 Add-Type -TypeDefinition @'
 using System;
 using System.Runtime.InteropServices;
+using System.Threading;
+
 public static class OsPickWin32 {
     [DllImport("user32.dll")] public static extern short GetAsyncKeyState(int vKey);
     [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
+    [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+    [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+    [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+    [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
+    [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
+    [StructLayout(LayoutKind.Sequential)] public struct MSLLHOOKSTRUCT { public POINT pt; public uint mouseData; public uint flags; public uint time; public IntPtr dwExtraInfo; }
+
+    public delegate IntPtr HookProc(int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] static extern IntPtr SetWindowsHookEx(int idHook, HookProc lpfn, IntPtr hMod, uint dwThreadId);
+    [DllImport("user32.dll")] static extern bool UnhookWindowsHookEx(IntPtr hhk);
+    [DllImport("user32.dll")] static extern IntPtr CallNextHookEx(IntPtr hhk, int nCode, IntPtr wParam, IntPtr lParam);
+    [DllImport("user32.dll")] static extern int GetMessage(out MSG m, IntPtr hWnd, uint min, uint max);
+    [DllImport("user32.dll")] static extern bool TranslateMessage(ref MSG m);
+    [DllImport("user32.dll")] static extern IntPtr DispatchMessage(ref MSG m);
+    [DllImport("user32.dll")] static extern bool PostThreadMessage(uint idThread, uint msg, IntPtr wParam, IntPtr lParam);
+    [DllImport("kernel32.dll")] static extern uint GetCurrentThreadId();
+
+    const int WH_MOUSE_LL = 14;
+    const int WM_LBUTTONDOWN = 0x0201;
+    const int WM_RBUTTONDOWN = 0x0204;
+    const uint WM_QUIT = 0x0012;
+
+    public static volatile bool Active;
+    public static volatile int X;
+    public static volatile int Y;
+    public static volatile bool Clicked;
+    public static volatile bool Cancelled;
+
+    static HookProc proc;
+    static IntPtr hook;
+    static Thread thread;
+    static uint threadId;
+
+    public static void Start() {
+        Cancelled = false;
+        Clicked = false;
+        Active = true;
+        threadId = 0;
+        thread = new Thread(Run);
+        thread.IsBackground = true;
+        thread.Start();
+        for (int i = 0; i < 60 && threadId == 0; i++) Thread.Sleep(5);
+    }
+
+    static void Run() {
+        threadId = GetCurrentThreadId();
+        proc = Callback;
+        hook = SetWindowsHookEx(WH_MOUSE_LL, proc, IntPtr.Zero, 0);
+        MSG msg;
+        while (Active && GetMessage(out msg, IntPtr.Zero, 0, 0) > 0) {
+            TranslateMessage(ref msg);
+            DispatchMessage(ref msg);
+        }
+        if (hook != IntPtr.Zero) { UnhookWindowsHookEx(hook); hook = IntPtr.Zero; }
+        threadId = 0;
+    }
+
+    static IntPtr Callback(int nCode, IntPtr wParam, IntPtr lParam) {
+        if (nCode >= 0 && Active) {
+            try {
+                MSLLHOOKSTRUCT data = (MSLLHOOKSTRUCT)Marshal.PtrToStructure(lParam, typeof(MSLLHOOKSTRUCT));
+                X = data.pt.X;
+                Y = data.pt.Y;
+                int message = wParam.ToInt32();
+                if (message == WM_LBUTTONDOWN) { Clicked = true; return (IntPtr)1; }
+                if (message == WM_RBUTTONDOWN) { Cancelled = true; return (IntPtr)1; }
+            } catch { }
+        }
+        return CallNextHookEx(hook, nCode, wParam, lParam);
+    }
+
+    public static void Stop() {
+        Active = false;
+        if (threadId != 0) PostThreadMessage(threadId, WM_QUIT, IntPtr.Zero, IntPtr.Zero);
+        if (thread != null) { thread.Join(400); thread = null; }
+    }
 }
 '@
+
+# 0x20 = WS_EX_TRANSPARENT: skip hit-testing so UI Automation resolves the app under
+# the overlay instead of the overlay itself. 0x80 = WS_EX_TOOLWINDOW.
+$WS_EX_TRANSPARENT = 0x20
+$WS_EX_TOOLWINDOW = 0x80
+$GWL_EXSTYLE = -20
+$SWP_FLAGS = 0x0002 -bor 0x0001 -bor 0x0004 -bor 0x0010 -bor 0x0020
+
+function Enable-DpiAwareness {
+    try { [void][OsPickWin32]::SetProcessDPIAware() } catch { }
+}
 
 function Get-ShortName([string]$programmatic) {
     if ([string]::IsNullOrEmpty($programmatic)) { return '' }
@@ -63,8 +156,6 @@ function Get-Pick([int]$x, [int]$y) {
 
     $bounds = $element.Current.BoundingRectangle
     $topBounds = $top.Current.BoundingRectangle
-    # Chromium/Electron windows expose only a generic pane until accessibility is
-    # switched on, so a pick that covers the whole window is reported as the window.
     $windowOnly = $true
     if ($bounds.Width -gt 0 -and $topBounds.Width -gt 0) {
         $windowOnly = (([math]::Abs($bounds.X - $topBounds.X) -lt 8) -and
@@ -72,6 +163,7 @@ function Get-Pick([int]$x, [int]$y) {
                        ([math]::Abs($bounds.Width - $topBounds.Width) -lt 8) -and
                        ([math]::Abs($bounds.Height - $topBounds.Height) -lt 8))
     }
+
     $processId = $element.Current.ProcessId
     $processName = ''
     $windowTitle = ''
@@ -96,12 +188,7 @@ function Get-Pick([int]$x, [int]$y) {
         windowTitle = $windowTitle
         windowOnly = $windowOnly
         cursor = @{ x = $x; y = $y }
-        bounds = @{
-            x = [int]$bounds.X
-            y = [int]$bounds.Y
-            w = [int]$bounds.Width
-            h = [int]$bounds.Height
-        }
+        bounds = @{ x = [int]$bounds.X; y = [int]$bounds.Y; w = [int]$bounds.Width; h = [int]$bounds.Height }
         chain = @($chain)
     }
 }
@@ -119,7 +206,120 @@ function Get-CursorPoint {
     return @{ x = $point.X; y = $point.Y }
 }
 
-# Hotkey: "Ctrl+Alt+P" -> modifier flags plus a virtual-key code.
+function New-Overlay {
+    $form = New-Object System.Windows.Forms.Form
+    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $form.StartPosition = 'Manual'
+    $form.Bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
+    $form.TopMost = $true
+    $form.ShowInTaskbar = $false
+    $form.BackColor = [System.Drawing.Color]::Fuchsia
+    $form.TransparencyKey = [System.Drawing.Color]::Fuchsia
+    $form.Cursor = [System.Windows.Forms.Cursors]::Cross
+    $form.Show()
+    $style = [OsPickWin32]::GetWindowLong($form.Handle, $GWL_EXSTYLE)
+    [void][OsPickWin32]::SetWindowLong($form.Handle, $GWL_EXSTYLE, ($style -bor $WS_EX_TRANSPARENT -bor $WS_EX_TOOLWINDOW))
+    [void][OsPickWin32]::SetWindowPos($form.Handle, [IntPtr]::Zero, 0, 0, 0, 0, $SWP_FLAGS)
+    return $form
+}
+
+function Set-Highlight($form, $rect, [string]$label, $previous) {
+    $form.Tag = @{ rect = $rect; label = $label }
+    $region = $null
+    if ($null -ne $rect) {
+        $region = New-Object System.Drawing.Region((New-Object System.Drawing.Rectangle(($rect.X - 2), ($rect.Y - 2), ($rect.Width + 4), ($rect.Height + 4))))
+    }
+    if ($null -ne $previous) {
+        $old = New-Object System.Drawing.Region((New-Object System.Drawing.Rectangle(($previous.X - 2), ($previous.Y - 2), ($previous.Width + 4), ($previous.Height + 4))))
+        if ($null -eq $region) { $region = $old } else { $region.Union($old) }
+    }
+    if ($null -eq $region) { $form.Invalidate() } else { $form.Invalidate($region) }
+}
+
+function Start-Selection {
+    $overlay = New-Overlay
+    $overlay.Tag = @{ rect = $null; label = 'Move the pointer and click to pick  -  right click / Esc cancels' }
+    $overlay.Add_Paint({
+            param($sender, $eventArgs)
+            $state = $sender.Tag
+            if ($null -eq $state) { return }
+            $graphics = $eventArgs.Graphics
+            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 76, 141, 255), 2)
+            $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(235, 18, 26, 40))
+            $textBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
+            $font = New-Object System.Drawing.Font('Segoe UI', 9)
+            try {
+                $rect = $state.rect
+                if ($null -ne $rect -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
+                    $graphics.DrawRectangle($pen, $rect.X, $rect.Y, $rect.Width, $rect.Height)
+                }
+                if (-not [string]::IsNullOrEmpty($state.label)) {
+                    if ($null -ne $rect) {
+                        $px = $rect.X
+                        $py = [Math]::Max(0, $rect.Y - 24)
+                    } else {
+                        $px = 24
+                        $py = 24
+                    }
+                    $size = $graphics.MeasureString($state.label, $font)
+                    $graphics.FillRectangle($fill, $px, $py, ([int]$size.Width + 14), 22)
+                    $graphics.DrawString($state.label, $font, $textBrush, ($px + 6), ($py + 3))
+                }
+            } finally {
+                $pen.Dispose(); $fill.Dispose(); $textBrush.Dispose(); $font.Dispose()
+            }
+        })
+    $overlay.Show()
+    [void][OsPickWin32]::Start()
+
+    $hoverRect = $null
+    $lastKey = ''
+    $ESC = 0x1B
+    $result = $null
+    $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    while ($true) {
+        [System.Windows.Forms.Application]::DoEvents()
+        if ([OsPickWin32]::Cancelled) { break }
+        if (([OsPickWin32]::GetAsyncKeyState($ESC) -band 0x8000) -ne 0) { break }
+
+        $cursor = Get-CursorPoint
+        if ($null -ne $cursor) {
+            $pick = Get-Pick $cursor.x $cursor.y
+            if ($null -ne $pick) {
+                $box = $pick.bounds
+                $rect = New-Object System.Drawing.Rectangle($box.x, $box.y, $box.w, $box.h)
+                $label = (($pick.controlType + ' ' + $pick.name) -replace '\s+', ' ').Trim()
+                if ([string]::IsNullOrEmpty($label)) { $label = $pick.processName + ' - ' + $pick.windowTitle }
+                $key = '{0}:{1}:{2}:{3}' -f $box.x, $box.y, $box.w, $box.h
+                if ($key -ne $lastKey) {
+                    $lastKey = $key
+                    Set-Highlight $overlay $rect $label $hoverRect
+                    $hoverRect = $rect
+                }
+            }
+        }
+
+        if ([OsPickWin32]::Clicked) {
+            $cursor = Get-CursorPoint
+            if ($null -ne $cursor) {
+                $overlay.Hide()
+                [System.Windows.Forms.Application]::DoEvents()
+                Start-Sleep -Milliseconds 40
+                $result = Get-Pick $cursor.x $cursor.y
+            }
+            break
+        }
+        Start-Sleep -Milliseconds $PollMs
+        if ($stopwatch.Elapsed.TotalMinutes -gt 3) { break }
+    }
+
+    [void][OsPickWin32]::Stop()
+    $overlay.Hide()
+    $overlay.Dispose()
+    return $result
+}
+
 $wantCtrl = $Hotkey -match '(?i)ctrl'
 $wantAlt = $Hotkey -match '(?i)alt'
 $wantShift = $Hotkey -match '(?i)shift'
@@ -139,27 +339,35 @@ function Test-Down([int]$vkey) {
     return (([OsPickWin32]::GetAsyncKeyState($vkey) -band 0x8000) -ne 0)
 }
 
-if ($Once) {
+function Test-Hotkey {
+    $down = (Test-Down $vk)
+    if ($wantCtrl) { $down = $down -and (Test-Down $VK_CONTROL) }
+    if ($wantAlt) { $down = $down -and (Test-Down $VK_MENU) }
+    if ($wantShift) { $down = $down -and (Test-Down $VK_SHIFT) }
+    if ($wantWin) { $down = $down -and (Test-Down $VK_LWIN) }
+    return $down
+}
+
+Enable-DpiAwareness
+
+if ($Once -or $PostOnce) {
     $cursor = Get-CursorPoint
     if ($null -eq $cursor) { Write-Output '{"error":"no cursor"}'; exit 1 }
     $pick = Get-Pick $cursor.x $cursor.y
     if ($null -eq $pick) { Write-Output '{"error":"no element"}'; exit 1 }
-    Write-Output ($pick | ConvertTo-Json -Depth 6 -Compress)
+    if ($Once) {
+        Write-Output ($pick | ConvertTo-Json -Depth 6 -Compress)
+        exit 0
+    }
+    try { Send-Pick $pick; Write-Output 'posted' } catch { Write-Output ('post failed: ' + $_.Exception.Message); exit 1 }
     exit 0
 }
 
-if ($PostOnce) {
-    $cursor = Get-CursorPoint
-    if ($null -eq $cursor) { Write-Output '{"error":"no cursor"}'; exit 1 }
-    $pick = Get-Pick $cursor.x $cursor.y
-    if ($null -eq $pick) { Write-Output '{"error":"no element"}'; exit 1 }
-    try {
-        Send-Pick $pick
-        Write-Output 'posted'
-    } catch {
-        Write-Output ('post failed: ' + $_.Exception.Message)
-        exit 1
-    }
+if ($Select) {
+    Write-Output 'selecting'
+    $pick = Start-Selection
+    if ($null -eq $pick) { Write-Output 'cancelled'; exit 2 }
+    try { Send-Pick $pick; Write-Output ('picked ' + $pick.controlType + ' ' + $pick.name) } catch { Write-Output ('post failed: ' + $_.Exception.Message); exit 1 }
     exit 0
 }
 
@@ -167,29 +375,23 @@ Write-Output ('ready hotkey=' + $Hotkey + ' -> ' + $BaseUrl)
 $wasDown = $false
 while ($true) {
     try {
-        $down = (Test-Down $vk)
-        if ($wantCtrl) { $down = $down -and (Test-Down $VK_CONTROL) }
-        if ($wantAlt) { $down = $down -and (Test-Down $VK_MENU) }
-        if ($wantShift) { $down = $down -and (Test-Down $VK_SHIFT) }
-        if ($wantWin) { $down = $down -and (Test-Down $VK_LWIN) }
-
+        $down = Test-Hotkey
         if ($down -and -not $wasDown) {
-            $cursor = Get-CursorPoint
-            if ($null -ne $cursor) {
-                $pick = Get-Pick $cursor.x $cursor.y
-                if ($null -ne $pick) {
-                    try {
-                        Send-Pick $pick
-                        Write-Output ('picked ' + $pick.controlType + ' ' + $pick.name)
-                    } catch {
-                        Write-Output ('post failed: ' + $_.Exception.Message)
-                    }
+            $pick = Start-Selection
+            if ($null -ne $pick) {
+                try {
+                    Send-Pick $pick
+                    Write-Output ('picked ' + $pick.controlType + ' ' + $pick.name)
+                } catch {
+                    Write-Output ('post failed: ' + $_.Exception.Message)
                 }
+            } else {
+                Write-Output 'cancelled'
             }
         }
         $wasDown = $down
     } catch {
         Write-Output ('loop error: ' + $_.Exception.Message)
     }
-    Start-Sleep -Milliseconds $PollMs
+    Start-Sleep -Milliseconds 60
 }

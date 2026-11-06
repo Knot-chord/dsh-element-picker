@@ -854,7 +854,7 @@ window.__ModuleLoader__.load({
     let toastNode = null
     let toastTimer = 0
 
-    function toast(message) {
+    function toast(message, holdMs = 1600) {
       if (toastNode === null || toastNode.parentNode === null) {
         toastNode = document.createElement('div')
         toastNode.className = 'dsh-ep-toast'
@@ -864,8 +864,10 @@ window.__ModuleLoader__.load({
       toastNode.dataset.show = '1'
       clearTimeout(toastTimer)
       toastTimer = setTimeout(() => {
-        if (toastNode !== null) toastNode.dataset.show = ''
-      }, 1600)
+        // `dataset.show = ''` would keep the attribute and keep `[data-show]`
+        // matching, so the toast never faded; remove it instead.
+        if (toastNode !== null) delete toastNode.dataset.show
+      }, holdMs)
     }
 
     function copyText(text) {
@@ -1552,8 +1554,13 @@ window.__ModuleLoader__.load({
         button.addEventListener('click', (event) => {
           event.preventDefault()
           event.stopPropagation()
-          if (picker.isActive()) picker.stop()
-          else picker.start()
+          if (picker.isActive()) {
+            picker.stop()
+          } else {
+            picker.start()
+            // Tell the user the other window path exists without changing the icon.
+            toast(t('osHintToast').replace('{hotkey}', hotkey === '' ? 'Ctrl+Alt+P' : hotkey), 4200)
+          }
           paint()
         })
         place.host.insertBefore(button, place.before)
@@ -1639,6 +1646,7 @@ window.__ModuleLoader__.load({
                 copiedPath: '路径已复制',
                 osPicked: '已引用外部控件：{label}',
                 osHint: '外部窗口 {hotkey}',
+                osHintToast: '外部窗口元素：按 {hotkey} 进入选取，点一下就会进输入框',
               },
               en: {
                 btn: 'Reference: click to start picking (Esc to exit)',
@@ -1656,6 +1664,7 @@ window.__ModuleLoader__.load({
                 copiedPath: 'Path copied',
                 osPicked: 'Referenced external control: {label}',
                 osHint: 'outside window: {hotkey}',
+                osHintToast: 'Outside DSH: press {hotkey} to pick, click to insert',
               },
             }),
           'dsh-element-picker: dictionaries',
