@@ -34,7 +34,7 @@ import { existsSync, mkdirSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
-import { pickInBrowser } from './cdp.js'
+import { findDebugPort, pickInBrowser } from './cdp.js'
 
 const POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 const HERE = dirname(fileURLToPath(import.meta.url))
