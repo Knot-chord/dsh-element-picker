@@ -79,6 +79,8 @@ public static class OsPickWin32 {
     [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+    [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr hWnd, uint flags);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr hWnd, System.Text.StringBuilder text, int max);
 
     [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder name, int max);
@@ -271,6 +273,33 @@ function Get-CursorPoint {
     return @{ x = $point.X; y = $point.Y }
 }
 
+# The top-level window under a screen point.
+function Get-RootWindow([int]$x, [int]$y) {
+    $handle = [OsPickWin32]::WindowAt($x, $y)
+    if ($handle -eq [IntPtr]::Zero) { return $null }
+    $root = [OsPickWin32]::GetAncestor($handle, 2)  # GA_ROOT
+    if ($root -eq [IntPtr]::Zero) { return $handle }
+    return $root
+}
+
+function Get-WindowTitle([IntPtr]$handle) {
+    $buffer = New-Object System.Text.StringBuilder(512)
+    [void][OsPickWin32]::GetWindowText($handle, $buffer, $buffer.Capacity)
+    return $buffer.ToString()
+}
+
+# Ask the host to pick inside the matching browser tab over the DevTools protocol.
+function Try-CdpPick([string]$windowTitle) {
+    try {
+        $payload = ConvertTo-Json @{ windowTitle = $windowTitle }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        $uri = ($BaseUrl.TrimEnd('/')) + '/element-picker/os/cdp/pick'
+        return Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 100
+    } catch {
+        return @{ ok = $false; reason = 'cdp-request-failed' }
+    }
+}
+
 function New-Overlay {
     $form = New-Object System.Windows.Forms.Form
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
@@ -371,6 +400,22 @@ function Start-Selection {
                 $overlay.Hide()
                 [System.Windows.Forms.Application]::DoEvents()
                 Start-Sleep -Milliseconds 40
+
+                # A browser window cannot answer for its DOM. If it was started with a
+                # debugging port, hand the pick to the tab and let it resolve there.
+                $root = Get-RootWindow $cursor.x $cursor.y
+                $rootClass = if ($null -ne $root) { [OsPickWin32]::ClassOf($root) } else { '' }
+                if ($rootClass -match 'Chrome_WidgetWin') {
+                    $title = Get-WindowTitle $root
+                    $cdp = Try-CdpPick $title
+                    if ($cdp -and $cdp.ok -eq $true) {
+                        $script:lastCdpReason = ''
+                        $result = @{ cdp = $true }
+                        break
+                    }
+                    $script:lastCdpReason = if ($cdp) { [string]$cdp.reason } else { 'no-response' }
+                }
+
                 $result = Get-Pick $cursor.x $cursor.y
             }
             break

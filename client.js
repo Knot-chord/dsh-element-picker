@@ -1785,6 +1785,22 @@ window.__ModuleLoader__.load({
             if (typeof state.hotkey === 'string') strip.setHotkey(state.hotkey)
             const pick = state.pick
             if (pick === null || pick === undefined) return
+            if (pick.cdp === true) {
+              // A browser tab answered over the DevTools protocol: this is a real DOM
+              // element, so it carries a selector and a page just like an in-app pick.
+              const domLabel = String(pick.label || pick.text || '').trim().slice(0, 60)
+              if (domLabel === '') return
+              const domPayload = {
+                kind: 'element',
+                label: domLabel,
+                selector: String(pick.selector || ''),
+                page: String(pick.page || ''),
+                text: String(pick.text || ''),
+              }
+              if (!commitChip(domPayload)) commitReference(fieldsOf(domPayload))
+              toast(t('osPicked').replace('{label}', domLabel))
+              return
+            }
             const control = [pick.controlType, pick.name].filter(Boolean).join(' · ')
             const label = (pick.windowOnly === true ? pick.windowTitle || control : control || pick.windowTitle || '')
               .trim()

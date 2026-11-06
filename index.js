@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { findDebugPort, listTargets, pickInBrowser } from './cdp.js'
 
 export const name = 'element-picker'
 export const inject = ['webServer']
@@ -82,6 +83,38 @@ export function apply(ctx, config = {}) {
         state.revision += 1
         health.error = ''
         sendJson(res, 200, { ok: true, revision: state.revision })
+        return
+      }
+
+      // Browser windows do not expose their DOM to UI Automation; when the browser
+      // was started with a debugging port, the tab itself is asked for the element.
+      if (url.pathname === `${ROUTE}/cdp/pick` && req.method === 'POST') {
+        const body = await readJson(req)
+        const outcome = await pickInBrowser({ windowTitle: body.windowTitle })
+        if (outcome.ok !== true) {
+          sendJson(res, 200, outcome)
+          return
+        }
+        state.pick = { ...outcome.pick, cdp: true, receivedAt: Date.now() }
+        state.revision += 1
+        health.error = ''
+        sendJson(res, 200, { ok: true, revision: state.revision })
+        return
+      }
+
+      if (url.pathname === `${ROUTE}/cdp/status` && req.method === 'GET') {
+        const found = await findDebugPort()
+        if (found === null) {
+          sendJson(res, 200, { available: false })
+          return
+        }
+        const targets = await listTargets(found.port)
+        sendJson(res, 200, {
+          available: true,
+          port: found.port,
+          browser: found.version?.Browser ?? '',
+          targets: targets.map((target) => ({ id: target.id, title: target.title, url: target.url })),
+        })
         return
       }
 
