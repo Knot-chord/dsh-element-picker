@@ -1360,9 +1360,21 @@ window.__ModuleLoader__.load({
       }
 
       function onMove(event, doc) {
+        try {
+          onMoveInner(event, doc)
+        } catch (error) {
+          console.warn('[element-picker] move failed', error)
+        }
+      }
+
+      function onMoveInner(event, doc) {
         const next = targetOf(event, doc)
         if (next !== null && next.tagName === 'WEBVIEW') {
+          // The guest page has its own agent and paints its own outline; only drop the
+          // app-side element so a click cannot reuse it. Do not repaint here — that
+          // would wipe the guest's box and tip on every move.
           hovered = null
+          current = null
           return
         }
         if (next === hovered) return
@@ -1414,6 +1426,14 @@ window.__ModuleLoader__.load({
       }
 
       function onClick(event, doc) {
+        try {
+          onClickInner(event, doc)
+        } catch (error) {
+          console.warn('[element-picker] click failed', error)
+        }
+      }
+
+      function onClickInner(event, doc) {
         const target = targetOf(event, doc)
         if (target === null) return
         if (isNativeReferenceControl(target)) return
@@ -1443,6 +1463,14 @@ window.__ModuleLoader__.load({
       }
 
       function onKey(event) {
+        try {
+          onKeyInner(event)
+        } catch (error) {
+          console.warn('[element-picker] key failed', error)
+        }
+      }
+
+      function onKeyInner(event) {
         if (!active) return
         if (event.key === 'Escape') {
           event.preventDefault()
