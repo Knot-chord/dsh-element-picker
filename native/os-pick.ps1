@@ -13,6 +13,14 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
+# Single instance: two helpers would open two overlays and swallow each other's
+# clicks. The named mutex is released by the OS when this process exits.
+$pickerMutex = New-Object System.Threading.Mutex($false, 'Global\DshElementPickerOsPick')
+if (-not $pickerMutex.WaitOne(0)) {
+    Write-Output 'another helper is already running'
+    exit 3
+}
+
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing

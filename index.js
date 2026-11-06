@@ -15,6 +15,13 @@ export const name = 'element-picker'
 export const inject = ['webServer']
 
 const ROUTE = '/element-picker/os'
+
+/**
+ * Only one helper may run: a remount (bundle toggle, HMR) must not leave the
+ * previous PowerShell listening for the same hotkey, because two helpers open two
+ * overlays and swallow each other's picks.
+ */
+let liveHelper = null
 const MAX_BODY = 64 * 1024
 const POWERSHELL = 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'
 
@@ -51,9 +58,15 @@ export function apply(ctx, config = {}) {
   const enabled = config.enabled !== false
   const hotkey = typeof config.hotkey === 'string' && config.hotkey !== '' ? config.hotkey : 'Ctrl+Alt+P'
 
+  /**
+   * The revision counter restarts with every mount, so it is paired with a
+   * per-mount generation: a page that remembers an old revision must not treat new
+   * picks as already seen.
+   */
+  const generation = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8)
   /** @type {{ revision: number, pick: object | null }} */
   const state = { revision: 0, pick: null }
-  const health = { helper: false, error: '', hotkey, startedAt: 0 }
+  const health = { helper: false, error: '', hotkey, startedAt: 0, polls: 0 }
 
   const handler = async (req, res) => {
     try {
@@ -73,14 +86,17 @@ export function apply(ctx, config = {}) {
       }
 
       if (url.pathname === `${ROUTE}/state` && req.method === 'GET') {
+        health.polls += 1
         const since = Number(url.searchParams.get('since') ?? '0')
         const fresh = Number.isFinite(since) && since < state.revision
         sendJson(res, 200, {
+          generation,
           revision: state.revision,
           hotkey,
           enabled,
           helper: health.helper,
           error: health.error,
+          polls: health.polls,
           pick: fresh ? state.pick : null,
         })
         return
@@ -112,6 +128,14 @@ export function apply(ctx, config = {}) {
     const start = () => {
       restart = null
       if (stopped || child !== null) return
+      if (liveHelper !== null && liveHelper !== child) {
+        try {
+          liveHelper.kill()
+        } catch (error) {
+          /* already gone */
+        }
+        liveHelper = null
+      }
       let origin = ''
       try {
         origin = ctx.webServer.getOrigin()
@@ -131,12 +155,14 @@ export function apply(ctx, config = {}) {
       }
       health.helper = true
       health.startedAt = Date.now()
+      liveHelper = child
       child.unref()
       child.stdout?.on('data', () => {})
       child.stderr?.on('data', (chunk) => {
         health.error = String(chunk).trim().slice(0, 200)
       })
       child.on('exit', () => {
+        if (liveHelper === child) liveHelper = null
         child = null
         health.helper = false
         if (!stopped) restart = setTimeout(start, 4000)
@@ -150,6 +176,7 @@ export function apply(ctx, config = {}) {
       if (restart !== null) clearTimeout(restart)
       if (child !== null) {
         const dying = child
+        if (liveHelper === dying) liveHelper = null
         child = null
         // Close the pipes first: killing a child whose stdio handles are still open
         // during host shutdown trips libuv's assertion on Windows.

@@ -1762,6 +1762,7 @@ window.__ModuleLoader__.load({
         // Elements outside DSH: the native helper posts what sits under the mouse
         // when the global hotkey fires, and this loop turns it into a chip.
         let osRevision = 0
+        let osGeneration = ''
         let osTimer = 0
         let osBusy = false
         const pollOsPick = async () => {
@@ -1773,6 +1774,13 @@ window.__ModuleLoader__.load({
             })
             if (!response.ok) return
             const state = await response.json()
+            // The host restarts its revision counter on every mount; a stale local
+            // counter would swallow every new pick.
+            if (typeof state.generation === 'string' && state.generation !== osGeneration) {
+              osGeneration = state.generation
+              osRevision = 0
+              return
+            }
             if (typeof state.revision === 'number') osRevision = Math.max(osRevision, state.revision)
             if (typeof state.hotkey === 'string') strip.setHotkey(state.hotkey)
             const pick = state.pick
