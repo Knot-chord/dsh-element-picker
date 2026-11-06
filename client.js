@@ -429,6 +429,9 @@ window.__ModuleLoader__.load({
             lines.push('位置: ' + [box.x, box.y].join(',') + ' ' + [box.w, box.h].join('×'))
           }
         }
+        if (payload.context) lines.push('位置: ' + payload.context)
+        if (payload.content) lines.push('内容定位: ' + payload.content)
+        if (payload.textRange) lines.push('文本区间: ' + payload.textRange)
         if (payload.resource) lines.push('资源: ' + payload.resource)
         if (payload.page && !payload.os) lines.push('页面: ' + payload.page)
         if (payload.frame) lines.push('框架: ' + payload.frame)
@@ -544,6 +547,95 @@ window.__ModuleLoader__.load({
     }
 
     /** Payload for one pick; a kind with nothing to carry falls back to the element. */
+    /* --------------------------------------------------------- choosing */
+
+    /** Elements a user actually means when they point at text inside them. */
+    const MEANINGFUL_TAGS = /^(BUTTON|A|INPUT|TEXTAREA|SELECT|LABEL|TR|LI|IMG|H[1-6]|SUMMARY|DETAILS)$/
+
+    function isMeaningful(node) {
+      if (node === null || node.nodeType !== 1) return false
+      if (MEANINGFUL_TAGS.test(node.tagName)) return true
+      if (node.hasAttribute('role')) return true
+      if (node.hasAttribute('aria-label') || node.hasAttribute('data-testid') || node.hasAttribute('name')) return true
+      if (node.isContentEditable) return true
+      return false
+    }
+
+    /** Climb until the node is something a user would name ("the button", "the row"). */
+    function meaningfulAncestor(node) {
+      let element = node
+      for (let depth = 0; depth < 6 && element !== null && element.parentElement !== null; depth += 1) {
+        if (isMeaningful(element)) return element
+        element = element.parentElement
+      }
+      return node
+    }
+
+    function climb(node, levels) {
+      let element = node
+      for (let step = 0; step < levels && element !== null && element.parentElement !== null; step += 1) {
+        element = element.parentElement
+      }
+      return element
+    }
+
+    function clip(text, length) {
+      return String(text || '').replace(/\s+/g, ' ').trim().slice(0, length)
+    }
+
+    /** "设置 > 音频 > 输出设备" from ancestor labels and headings. */
+    function contextOf(node) {
+      const parts = []
+      let element = node
+      for (let depth = 0; depth < 5 && element !== null && element !== document.body; depth += 1) {
+        const parent = element.parentElement
+        if (parent === null) break
+        const label = parent.getAttribute('aria-label') || parent.getAttribute('data-testid') || ''
+        if (label !== '') {
+          parts.unshift(clip(label, 24))
+        } else {
+          let heading = null
+          for (const child of Array.from(parent.children)) {
+            if (/^H[1-6]$/.test(child.tagName)) {
+              heading = child
+              break
+            }
+          }
+          if (heading !== null) parts.unshift(clip(heading.textContent, 24))
+        }
+        element = parent
+        if (parts.length >= 3) break
+      }
+      return parts.filter(Boolean).join(' > ')
+    }
+
+    /** A re-findable locator that survives a rebuild: role + visible text. */
+    function contentLocator(node) {
+      const role = node.getAttribute('role') || node.tagName.toLowerCase()
+      const name =
+        node.getAttribute('aria-label') ||
+        ownText(node) ||
+        node.getAttribute('title') ||
+        node.getAttribute('alt') ||
+        ''
+      const text = clip(name, 40)
+      return text === '' ? '' : role + ' >> text=' + text
+    }
+
+    /** The selected text range inside the node, when the user selected some. */
+    function textRangeOf(node) {
+      try {
+        const selection = window.getSelection()
+        if (selection === null || selection.rangeCount === 0) return null
+        const range = selection.getRangeAt(0)
+        if (!node.contains(range.commonAncestorContainer)) return null
+        const text = clip(String(range), 120)
+        return text === '' ? null : text
+      } catch (error) {
+        return null
+      }
+    }
+
     function buildPayload(kind, node, page) {
       if (kind === 'url') {
         const found = urlOf(node)
@@ -570,6 +662,9 @@ window.__ModuleLoader__.load({
         page: page || location.href,
         frame: top === null ? '' : top.getAttribute('src') || top.getAttribute('data-src') || '',
         text: ownText(node),
+        context: contextOf(node),
+        content: contentLocator(node),
+        textRange: textRangeOf(node),
       }
     }
 
@@ -980,7 +1075,7 @@ window.__ModuleLoader__.load({
       id: 'element',
       order: 35,
       match(text, from) {
-        const pattern = /\[引用(元素|网址|文件)\][^\n]*(?:\n(?:选择器|资源|窗口|控件|定位|位置|页面|框架|文本|链接|路径):[^\n]*)*/gu
+        const pattern = /\[引用(元素|网址|文件)\][^\n]*(?:\n(?:选择器|资源|窗口|控件|定位|位置|内容定位|文本区间|页面|框架|文本|链接|路径):[^\n]*)*/gu
         pattern.lastIndex = from
         const found = pattern.exec(text)
         if (found === null) return undefined
@@ -991,10 +1086,12 @@ window.__ModuleLoader__.load({
         const data = { kind, label, selector: '', resource: '', page: '', frame: '', text: '', url: '', path: '', raw }
         const os = { window: '', control: '', locator: '', box: '' }
         for (const line of lines.slice(1)) {
-          const field = /^(选择器|资源|窗口|控件|定位|位置|页面|框架|文本|链接|路径):\s*(.*)$/u.exec(line)
+          const field = /^(选择器|资源|窗口|控件|定位|位置|内容定位|文本区间|页面|框架|文本|链接|路径):\s*(.*)$/u.exec(line)
           if (field === null) continue
           if (field[1] === '选择器') data.selector = field[2]
           else if (field[1] === '资源') data.resource = field[2]
+          else if (field[1] === '内容定位') data.content = field[2]
+          else if (field[1] === '文本区间') data.textRange = field[2]
           else if (field[1] === '窗口') os.window = field[2]
           else if (field[1] === '控件') os.control = field[2]
           else if (field[1] === '定位') os.locator = field[2]
@@ -1151,6 +1248,10 @@ window.__ModuleLoader__.load({
       let tip = null
       let active = false
       let hovered = null
+      /** What a click would reference right now (the climbed element). */
+      let current = null
+      /** Ctrl-clicked picks waiting to be merged into one chip. */
+      let pending = []
       let warnTimer = 0
       let scanTimer = 0
       const bound = new Map()
@@ -1266,7 +1367,50 @@ window.__ModuleLoader__.load({
         }
         if (next === hovered) return
         hovered = next
-        paint(next)
+        // Hovering shows what the user probably means (the button, the row) rather than
+        // the innermost span; the arrows still let them walk the tree either way.
+        current = next === null ? null : meaningfulAncestor(next)
+        paint(current)
+      }
+
+      function commitPicked(element, options = {}) {
+        if (element === null) return false
+        const wanted = options.kind ?? 'element'
+        let payload = null
+        try {
+          payload = buildPayload(wanted, element, element.ownerDocument === document ? location.href : '')
+        } catch (error) {
+          payload = null
+        }
+        if (payload === null) return false
+        if (options.multi === true) {
+          pending.push(payload)
+          paint(element)
+          ensureUi()
+          warn(t('multiSelected').replace('{n}', String(pending.length)))
+          return true
+        }
+        const reference = fieldsOf(payload)
+        payload.clipboard = reference
+        if (commitChip(payload)) return true
+        if (payload.kind === 'file' && payload.path && commitReference(mentionOf(payload.path))) return true
+        return commitReference(reference)
+      }
+
+      /** One chip for several picks: the selector list stays readable. */
+      function commitPending() {
+        if (pending.length === 0) return false
+        const payload = {
+          kind: 'element',
+          label: pending.length + ' 个元素',
+          selector: pending.map((item) => item.selector).join(' | '),
+          page: pending[0].page,
+          text: pending.map((item) => item.text || item.label).join(' / ').slice(0, 200),
+        }
+        const reference = fieldsOf(payload)
+        payload.clipboard = reference
+        pending = []
+        return commitChip(payload) || commitReference(reference)
       }
 
       function onClick(event, doc) {
@@ -1282,32 +1426,52 @@ window.__ModuleLoader__.load({
           warn(t('sandboxedHint'))
           return
         }
-        let payload = null
-        try {
-          const wanted = event.altKey ? 'url' : event.shiftKey ? 'file' : 'element'
-          payload = buildPayload(wanted, target, doc === document ? location.href : '')
-        } catch (error) {
-          payload = null
+        // Ctrl adds to the pending set and keeps picking; a plain click finishes.
+        if (event.ctrlKey) {
+          hovered = target
+          current = meaningfulAncestor(target)
+          commitPicked(current, { multi: true })
+          return
         }
+        const wanted = event.altKey ? 'url' : event.shiftKey ? 'file' : 'element'
+        const element = wanted === 'element' ? (current ?? meaningfulAncestor(target)) : target
         hovered = null
         stop()
-        if (payload !== null) {
-          const reference = fieldsOf(payload)
-          payload.clipboard = reference
-          if (commitChip(payload)) return
-          // No chip possible: a file still has its native text form.
-          if (payload.kind === 'file' && payload.path && commitReference(mentionOf(payload.path))) return
-          if (commitReference(reference)) return
-        }
+        if (commitPicked(element, { kind: wanted })) return
         ensureUi()
-        warn(payload === null ? t('pickFailed') : t('noComposer'))
+        warn(t('noComposer'))
       }
 
       function onKey(event) {
-        if (event.key !== 'Escape' || !active) return
-        event.preventDefault()
-        event.stopPropagation()
-        stop()
+        if (!active) return
+        if (event.key === 'Escape') {
+          event.preventDefault()
+          event.stopPropagation()
+          stop()
+          return
+        }
+        if (event.key === 'Enter') {
+          event.preventDefault()
+          event.stopPropagation()
+          if (pending.length > 0) {
+            commitPending()
+            stop()
+          } else if (current !== null) {
+            const element = current
+            stop()
+            commitPicked(element)
+          }
+          return
+        }
+        if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
+          event.preventDefault()
+          event.stopPropagation()
+          const anchor = current ?? hovered
+          if (anchor === null) return
+          current = event.key === 'ArrowUp' ? climb(anchor, 1) : anchor
+          if (event.key === 'ArrowDown' && hovered !== null && hovered !== anchor) current = hovered
+          paint(current)
+        }
       }
 
       function bindDocument(doc) {
@@ -1471,9 +1635,11 @@ window.__ModuleLoader__.load({
         ensureUi()
         active = true
         hovered = null
+        current = null
+        pending = []
         viewHover = null
         startedViews.clear()
-        tip.textContent = t('hint')
+        tip.textContent = t('hintKeys')
         delete tip.dataset.warn
         tip.style.left = '16px'
         tip.style.top = '16px'
@@ -1491,6 +1657,7 @@ window.__ModuleLoader__.load({
         if (!active) return
         active = false
         hovered = null
+        current = null
         clearInterval(scanTimer)
         scanTimer = 0
         clearInterval(viewTimer)
@@ -1769,6 +1936,8 @@ window.__ModuleLoader__.load({
                 btn: '引用：点一下开始选取（Esc 退出）',
                 btnOn: '引用：选取中，点一下停止',
                 hint: '点元素引用它；⌥ 点取链接、⇧ 点取文件路径；Esc 退出',
+                hintKeys: '点元素引用它 · ↑↓ 切换层级 · Enter 确认 · Ctrl 点选多个 · Esc 退出',
+                multiSelected: '已选 {n} 个 · Enter 合并成一条引用',
                 hintLink: '⌥ 链接',
                 hintFile: '⇧ 文件',
                 hintNative: '官方引用按钮，直接点',
@@ -1791,6 +1960,8 @@ window.__ModuleLoader__.load({
                 btn: 'Reference: click to start picking (Esc to exit)',
                 btnOn: 'Reference: picking — click to stop',
                 hint: 'Click an element; ⌥-click for its link, ⇧-click for its file path; Esc to exit',
+                hintKeys: 'Click to reference · ↑↓ change level · Enter confirm · Ctrl-click to add · Esc to exit',
+                multiSelected: '{n} selected · Enter to merge into one reference',
                 hintLink: '⌥ link',
                 hintFile: '⇧ file',
                 hintNative: 'Native reference button — click it directly',
