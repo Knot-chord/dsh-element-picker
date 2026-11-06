@@ -4,7 +4,9 @@ param(
     [int]$PollMs = 35,
     [switch]$Once,
     [switch]$PostOnce,
-    [switch]$Select
+    [switch]$Select,
+    [string]$LockPath = '',
+    [string]$Point = ''
 )
 
 # os-pick.ps1 - press the hotkey to enter selection mode: move the pointer to see the
@@ -17,6 +19,7 @@ $ErrorActionPreference = 'Stop'
 # overlays and swallow each other's clicks. The lock file is held OPEN for the whole
 # process lifetime (FileShare.None), so a second helper cannot even read it while the
 # owner lives; a file left by a crashed helper is reclaimed.
+if ($Point -eq '' -and -not $Once -and -not $PostOnce) {
 if ([string]::IsNullOrEmpty($LockPath)) { $LockPath = Join-Path $env:TEMP 'dsh-element-picker.helper.lock' }
 $lockPath = $LockPath
 $lockStream = $null
@@ -57,6 +60,7 @@ $payload = ConvertTo-Json @{ pid = $PID; start = (Get-Process -Id $PID).StartTim
 $lockBytes = [System.Text.Encoding]::ASCII.GetBytes($payload)
 $lockStream.Write($lockBytes, 0, $lockBytes.Length)
 $lockStream.Flush()
+}
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -75,6 +79,23 @@ public static class OsPickWin32 {
     [DllImport("user32.dll")] public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
     [DllImport("user32.dll")] public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
     [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr hWnd, IntPtr after, int x, int y, int cx, int cy, uint flags);
+
+    [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder name, int max);
+    [DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+    public const uint WM_GETOBJECT = 0x003D;
+    public const int OBJID_CLIENT = -4;
+    public static IntPtr WindowAt(int x, int y) { POINT p; p.X = x; p.Y = y; return WindowFromPoint(p); }
+    public static string ClassOf(IntPtr hWnd) {
+        var buffer = new System.Text.StringBuilder(256);
+        GetClassName(hWnd, buffer, buffer.Capacity);
+        return buffer.ToString();
+    }
+    // Chromium keeps its accessibility tree off until a client asks for the window's
+    // accessible object; this message is that ask.
+    public static void AskAccessible(IntPtr hWnd) {
+        SendMessage(hWnd, WM_GETOBJECT, IntPtr.Zero, (IntPtr)OBJID_CLIENT);
+    }
 
     [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X; public int Y; }
     [StructLayout(LayoutKind.Sequential)] public struct MSG { public IntPtr hwnd; public uint message; public IntPtr wParam; public IntPtr lParam; public uint time; public POINT pt; }
@@ -393,6 +414,14 @@ function Test-Hotkey {
 }
 
 Enable-DpiAwareness
+
+if ($Point -ne '') {
+    $parts = $Point.Split(',')
+    $probe = Get-Pick ([int]$parts[0].Trim()) ([int]$parts[1].Trim())
+    if ($null -eq $probe) { Write-Output '{"error":"no element"}'; exit 1 }
+    Write-Output ($probe | ConvertTo-Json -Depth 6 -Compress)
+    exit 0
+}
 
 if ($Once -or $PostOnce) {
     $cursor = Get-CursorPoint
