@@ -294,6 +294,18 @@ function Get-WindowTitle([IntPtr]$handle) {
     return $buffer.ToString()
 }
 
+# Ask the host which provider owns a click, and on which side it runs.
+function Try-Plan($point, $window) {
+    try {
+        $payload = ConvertTo-Json @{ point = $point; window = $window } -Depth 5
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        $uri = ($BaseUrl.TrimEnd('/')) + '/element-picker/os/plan'
+        return Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 6
+    } catch {
+        return $null
+    }
+}
+
 # Ask the host to resolve this click through its provider/output engine.
 function Try-Resolve($point, $window) {
     try {
@@ -415,22 +427,31 @@ function Start-Selection {
                 $rootPid = if ($null -ne $root) { [OsPickWin32]::ProcessIdOf($root) } else { 0 }
                 $rootProcess = if ($rootPid -gt 0) { $p = Get-Process -Id $rootPid -ErrorAction SilentlyContinue; if ($p) { $p.ProcessName } else { '' } } else { '' }
 
-                # The host owns the decision: providers (browser/CDP, desktop wallpaper,
-                # UI Automation, user modules) resolve the point, outputs deliver it.
-                $resolved = Try-Resolve @{ x = $cursor.x; y = $cursor.y } @{
+                # Ask the host WHO handles this click. Host-side providers (CDP, wallpaper)
+                # run there; helper-side ones (UIA) run here, in-process, so a click does
+                # not pay for a fresh PowerShell start.
+                $windowInfo = @{
                     class = $rootClass
                     title = $rootTitle
                     processId = $rootPid
                     processName = $rootProcess
                 }
-                if ($resolved -and $resolved.ok -eq $true) {
-                    $result = @{ handoff = $true; provider = $resolved.provider; output = $resolved.output }
-                    break
+                $route = Try-Plan @{ x = $cursor.x; y = $cursor.y } $windowInfo
+                if ($route -and $route.where -eq 'host') {
+                    $resolved = Try-Resolve @{ x = $cursor.x; y = $cursor.y } $windowInfo
+                    if ($resolved -and $resolved.ok -eq $true) {
+                        $result = @{ handoff = $true; provider = $resolved.provider; output = $resolved.output }
+                        break
+                    }
+                    $script:lastResolveReason = if ($resolved) { [string]$resolved.reason } else { 'host-unreachable' }
                 }
-                $script:lastResolveReason = if ($resolved) { [string]$resolved.reason } else { 'host-unreachable' }
 
-                # Fallback: resolve locally so a host that is not mounted yet still works.
-                $result = Get-Pick $cursor.x $cursor.y
+                # Helper-side provider (UI Automation) runs right here.
+                $local = Get-Pick $cursor.x $cursor.y
+                if ($null -ne $local) {
+                    $local['provider'] = if ($route -and $route.provider) { [string]$route.provider } else { 'uia' }
+                }
+                $result = $local
             }
             break
         }

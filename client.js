@@ -1825,7 +1825,12 @@ window.__ModuleLoader__.load({
               osRevision = 0
               return
             }
-            if (typeof state.revision === 'number') osRevision = Math.max(osRevision, state.revision)
+            // A remount restarts the counter; also catch that from the numbers alone so a
+            // page holding a bigger value still receives new picks.
+            if (typeof state.revision === 'number') {
+              if (state.revision < osRevision) osRevision = 0
+              osRevision = Math.max(osRevision, state.revision)
+            }
             if (typeof state.hotkey === 'string') strip.setHotkey(state.hotkey)
             const pick = state.pick
             if (pick === null || pick === undefined) return

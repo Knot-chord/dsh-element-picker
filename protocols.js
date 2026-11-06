@@ -107,6 +107,9 @@ const uiaProvider = {
   id: 'uia',
   label: '桌面控件（UI Automation）',
   priority: 10,
+  // Runs inside the native helper: it already has UI Automation loaded, so no extra
+  // PowerShell process is spawned per pick.
+  where: 'helper',
   match() {
     return true
   },
@@ -135,6 +138,7 @@ const cdpProvider = {
   id: 'browser-cdp',
   label: '浏览器页面（CDP）',
   priority: 100,
+  where: 'host',
   match(ctx) {
     return /Chrome_WidgetWin/i.test(ctx.window?.class || '')
   },
@@ -159,6 +163,7 @@ const desktopWallpaperProvider = {
   id: 'desktop-wallpaper',
   label: '桌面壁纸（图片）',
   priority: 60,
+  where: 'host',
   match(ctx) {
     // The desktop is explorer's WorkerW/Progman with no title; only claim it when the
     // probe element is that surface, so ordinary windows keep their own provider.
@@ -390,6 +395,7 @@ export function createEngine(options) {
         label: entry.label ?? entry.id,
         priority: entry.priority ?? 0,
         origin: entry.origin,
+        where: entry.where === 'helper' ? 'helper' : 'host',
         file: entry.file,
       })),
       outputs: outputs.map((entry) => ({
@@ -400,6 +406,25 @@ export function createEngine(options) {
         file: entry.file,
       })),
     }
+  }
+
+  /**
+   * Decide who should handle this context without doing the work: host providers run
+   * here (CDP, wallpaper), helper providers run inside the native helper so a click
+   * does not pay for a fresh PowerShell process.
+   */
+  function plan(ctx) {
+    for (const provider of providers) {
+      let applies = false
+      try {
+        applies = provider.match(ctx) === true
+      } catch (error) {
+        applies = false
+      }
+      if (!applies) continue
+      return { ok: true, provider: provider.id, where: provider.where === 'helper' ? 'helper' : 'host' }
+    }
+    return { ok: true, provider: 'uia', where: 'helper' }
   }
 
   /** Resolve one context, then let the first output that accepts it deliver. */
@@ -475,6 +500,7 @@ export function createEngine(options) {
     dirs,
     registerProvider,
     registerOutput,
+    plan,
     pushPick: (pick) => options.onPick(pick),
     formatPick,
     helpers,

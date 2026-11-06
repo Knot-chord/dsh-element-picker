@@ -190,6 +190,22 @@ export function apply(ctx, config = {}) {
         return
       }
 
+      // Cheap routing decision: who handles this click, and on which side.
+      if (url.pathname === `${ROUTE}/plan` && req.method === 'POST') {
+        const body = await readJson(req)
+        const point = body.point ?? { x: 0, y: 0 }
+        sendJson(
+          res,
+          200,
+          engine.plan({
+            point: { x: Number(point.x) || 0, y: Number(point.y) || 0 },
+            window: body.window ?? {},
+            hotkey,
+          }),
+        )
+        return
+      }
+
       if (url.pathname === `${ROUTE}/resolve` && req.method === 'POST') {
         const body = await readJson(req)
         const point = body.point ?? { x: 0, y: 0 }
