@@ -294,6 +294,17 @@ function Get-WindowTitle([IntPtr]$handle) {
     return $buffer.ToString()
 }
 
+# Ask the host to pick inside the matching browser tab over the DevTools protocol.
+function Try-CdpPick([string]$windowTitle) {
+    try {
+        $payload = ConvertTo-Json @{ windowTitle = $windowTitle }
+        $bytes = [System.Text.Encoding]::UTF8.GetBytes($payload)
+        $uri = ($BaseUrl.TrimEnd('/')) + '/element-picker/os/cdp/pick'
+        return Invoke-RestMethod -Method Post -Uri $uri -ContentType 'application/json; charset=utf-8' -Body $bytes -TimeoutSec 100
+    } catch {
+        return @{ ok = $false; reason = 'cdp-request-failed' }
+    }
+}
 # Ask the host which provider owns a click, and on which side it runs.
 function Try-Plan($point, $window) {
     try {
@@ -427,30 +438,20 @@ function Start-Selection {
                 $rootPid = if ($null -ne $root) { [OsPickWin32]::ProcessIdOf($root) } else { 0 }
                 $rootProcess = if ($rootPid -gt 0) { $p = Get-Process -Id $rootPid -ErrorAction SilentlyContinue; if ($p) { $p.ProcessName } else { '' } } else { '' }
 
-                # Ask the host WHO handles this click. Host-side providers (CDP, wallpaper)
-                # run there; helper-side ones (UIA) run here, in-process, so a click does
-                # not pay for a fresh PowerShell start.
-                $windowInfo = @{
-                    class = $rootClass
-                    title = $rootTitle
-                    processId = $rootPid
-                    processName = $rootProcess
-                }
-                $route = Try-Plan @{ x = $cursor.x; y = $cursor.y } $windowInfo
-                if ($route -and $route.where -eq 'host') {
-                    $resolved = Try-Resolve @{ x = $cursor.x; y = $cursor.y } $windowInfo
-                    if ($resolved -and $resolved.ok -eq $true) {
-                        $result = @{ handoff = $true; provider = $resolved.provider; output = $resolved.output }
+                # Fast path: a Chromium window cannot answer for its DOM, so hand that one
+                # pick to the tab over CDP (the host queues the result). Everything else is
+                # resolved right here with UI Automation — no extra process per click.
+                if ($rootClass -match 'Chrome_WidgetWin') {
+                    $cdp = Try-CdpPick $rootTitle
+                    if ($cdp -and $cdp.ok -eq $true) {
+                        $result = $null
                         break
                     }
-                    $script:lastResolveReason = if ($resolved) { [string]$resolved.reason } else { 'host-unreachable' }
+                    $script:lastResolveReason = if ($cdp) { [string]$cdp.reason } else { 'no-response' }
                 }
 
-                # Helper-side provider (UI Automation) runs right here.
                 $local = Get-Pick $cursor.x $cursor.y
-                if ($null -ne $local) {
-                    $local['provider'] = if ($route -and $route.provider) { [string]$route.provider } else { 'uia' }
-                }
+                if ($null -ne $local) { $local['provider'] = 'uia' }
                 $result = $local
             }
             break
