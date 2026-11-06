@@ -6,7 +6,8 @@ param(
     [switch]$PostOnce,
     [switch]$Select,
     [string]$LockPath = '',
-    [string]$Point = ''
+    [string]$Point = '',
+    [string]$Language = 'zh'
 )
 
 # os-pick.ps1 - press the hotkey to enter selection mode: move the pointer to see the
@@ -361,7 +362,8 @@ function Set-Highlight($form, $rect, [string]$label, $previous) {
 
 function Start-Selection {
     $overlay = New-Overlay
-    $overlay.Tag = @{ rect = $null; label = 'Move the pointer and click to pick  -  right click / Esc cancels' }
+    $hint = if ($Language -eq 'en') { 'Move the pointer and click to pick  -  right click / Esc cancels' } else { '移动鼠标并点击选取  ·  右键 / Esc 取消' }
+    $overlay.Tag = @{ rect = $null; label = $hint }
     $overlay.Add_Paint({
             param($sender, $eventArgs)
             $state = $sender.Tag
@@ -400,6 +402,9 @@ function Start-Selection {
     $ESC = 0x1B
     $result = $null
     $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+    $resolvedFor = ''
+    $lastPoint = $null
+    $lastMoveAt = $stopwatch.ElapsedMilliseconds
 
     while ($true) {
         [System.Windows.Forms.Application]::DoEvents()
@@ -408,17 +413,27 @@ function Start-Selection {
 
         $cursor = Get-CursorPoint
         if ($null -ne $cursor) {
-            $pick = Get-Pick $cursor.x $cursor.y
-            if ($null -ne $pick) {
-                $box = $pick.bounds
-                $rect = New-Object System.Drawing.Rectangle($box.x, $box.y, $box.w, $box.h)
-                $label = (($pick.controlType + ' ' + $pick.name) -replace '\s+', ' ').Trim()
-                if ([string]::IsNullOrEmpty($label)) { $label = $pick.processName + ' - ' + $pick.windowTitle }
-                $key = '{0}:{1}:{2}:{3}' -f $box.x, $box.y, $box.w, $box.h
-                if ($key -ne $lastKey) {
-                    $lastKey = $key
-                    Set-Highlight $overlay $rect $label $hoverRect
-                    $hoverRect = $rect
+            $pointKey = '{0}:{1}' -f $cursor.x, $cursor.y
+            if ($null -eq $lastPoint -or $lastPoint.x -ne $cursor.x -or $lastPoint.y -ne $cursor.y) {
+                $lastPoint = $cursor
+                $lastMoveAt = $stopwatch.ElapsedMilliseconds
+                # While the pointer travels, keep the previous outline on screen: a fresh
+                # AutomationElement.FromPoint can take 50-200 ms on a big window and would
+                # make the box lag behind the cursor.
+            } elseif ($pointKey -ne $resolvedFor -and ($stopwatch.ElapsedMilliseconds - $lastMoveAt) -ge 70) {
+                $resolvedFor = $pointKey
+                $pick = Get-Pick $cursor.x $cursor.y
+                if ($null -ne $pick) {
+                    $box = $pick.bounds
+                    $rect = New-Object System.Drawing.Rectangle($box.x, $box.y, $box.w, $box.h)
+                    $label = (($pick.controlType + ' ' + $pick.name) -replace '\s+', ' ').Trim()
+                    if ([string]::IsNullOrEmpty($label)) { $label = $pick.processName + ' - ' + $pick.windowTitle }
+                    $key = '{0}:{1}:{2}:{3}' -f $box.x, $box.y, $box.w, $box.h
+                    if ($key -ne $lastKey) {
+                        $lastKey = $key
+                        Set-Highlight $overlay $rect $label $hoverRect
+                        $hoverRect = $rect
+                    }
                 }
             }
         }
@@ -451,7 +466,12 @@ function Start-Selection {
                 }
 
                 $local = Get-Pick $cursor.x $cursor.y
-                if ($null -ne $local) { $local['provider'] = 'uia' }
+                if ($null -ne $local) {
+                    $local['provider'] = 'uia'
+                    if ($rootClass -match 'Chrome_WidgetWin' -and $script:lastResolveReason) {
+                        $local['cdpReason'] = [string]$script:lastResolveReason
+                    }
+                }
                 $result = $local
             }
             break

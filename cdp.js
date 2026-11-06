@@ -13,7 +13,9 @@
  */
 
 import { createHash, randomBytes } from 'node:crypto'
+import { existsSync, readFileSync } from 'node:fs'
 import { request } from 'node:http'
+import { join } from 'node:path'
 
 const PORTS = [9222, 9223, 9224, 9333]
 const TIMEOUT_MS = 90_000

@@ -59,6 +59,7 @@ async function readJson(req) {
 export function apply(ctx, config = {}) {
   const enabled = config.enabled !== false
   const hotkey = typeof config.hotkey === 'string' && config.hotkey !== '' ? config.hotkey : 'Ctrl+Alt+P'
+  const language = config.language === 'en' ? 'en' : 'zh'
 
   /**
    * The revision counter restarts with every mount, so it is paired with a
@@ -75,6 +76,7 @@ export function apply(ctx, config = {}) {
     home: process.env.DSH_HOME,
     inputs: Array.isArray(config.inputs) ? config.inputs : undefined,
     outputs: Array.isArray(config.outputs) ? config.outputs : undefined,
+    firstOnly: config.firstOnly === true,
     onPick: (pick) => {
       state.pick = { ...pick, receivedAt: Date.now() }
       state.revision += 1
@@ -284,6 +286,8 @@ export function apply(ctx, config = {}) {
             hotkey,
             '-LockPath',
             join(dirname(script), '..', 'os-pick.lock'),
+            '-Language',
+            language,
           ],
           { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
         )

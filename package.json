@@ -1,6 +1,6 @@
 {
   "name": "dsh-element-picker",
-  "version": "0.7.3",
+  "version": "0.8.1",
   "description": "Reference chips: one strip icon in the right sidebar turns elements, links and file paths into native composer chips — pick from DSH itself, same-origin frames, or the sidebar browser's webview guests; the chips serialize into the prompt and point back at what they name.",
   "type": "module",
   "main": "./index.js",
@@ -15,6 +15,8 @@
     "cdp.js",
     "protocols.js",
     "PROTOCOL.md",
+    "scripts/check-pack.mjs",
+    "scripts/e2e.mjs",
     "cordis.patch.yml",
     "native/os-pick.ps1"
   ],
@@ -31,7 +33,8 @@
     }
   },
   "scripts": {
-    "prepublishOnly": "node -e \"const fs=require(\u0027fs\u0027);const bad=[];for(const f of [\u0027package.json\u0027,\u0027cordis.patch.yml\u0027,\u0027client.js\u0027,\u0027index.js\u0027]){try{const b=fs.readFileSync(f);if(b[0]===0xEF\u0026\u0026b[1]===0xBB\u0026\u0026b[2]===0xBF)bad.push(f)}catch(e){}}if(bad.length){console.error(\u0027UTF-8 BOM in: \u0027+bad.join(\u0027, \u0027));process.exit(1)}JSON.parse(fs.readFileSync(\u0027package.json\u0027,\u0027utf8\u0027));console.log(\u0027manifest ok\u0027)\""
+    "prepublishOnly": "node scripts/check-pack.mjs",
+    "e2e": "node scripts/e2e.mjs"
   },
   "license": "MIT",
   "keywords": [

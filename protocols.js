@@ -310,6 +310,7 @@ export function createEngine(options) {
 
   const selectedIds = Array.isArray(options.inputs) && options.inputs.length > 0 ? options.inputs : null
   const selectedOutputs = Array.isArray(options.outputs) && options.outputs.length > 0 ? options.outputs : null
+  const firstOnly = options.firstOnly === true
 
   async function loadUserModules() {
     loadErrors = []
@@ -441,12 +442,18 @@ export function createEngine(options) {
       if (!applies) continue
       let pick = null
       try {
-        pick = await provider.pick(ctx)
+        // A user provider that hangs must not hold the whole click hostage.
+        const timeout = Number(provider.timeoutMs) > 0 ? Number(provider.timeoutMs) : 3000
+        pick = await Promise.race([
+          provider.pick(ctx),
+          new Promise((resolve) => setTimeout(() => resolve(null), timeout).unref?.()),
+        ])
       } catch (error) {
         pick = null
       }
       if (pick === null || pick === undefined) continue
       const enriched = { ...pick, provider: provider.id }
+      const delivered = []
       for (const output of outputs) {
         let accepts = false
         try {
@@ -455,10 +462,18 @@ export function createEngine(options) {
           accepts = false
         }
         if (!accepts) continue
-        await output.deliver(enriched, ctx)
-        return { ok: true, pick: enriched, provider: provider.id, output: output.id }
+        try {
+          await output.deliver(enriched, ctx)
+          delivered.push(output.id)
+        } catch (error) {
+          /* one failing output must not block the others */
+        }
+        if (firstOnly) break
       }
-      return { ok: false, reason: 'no-output', pick: enriched, provider: provider.id }
+      if (delivered.length === 0) {
+        return { ok: false, reason: 'no-output', pick: enriched, provider: provider.id }
+      }
+      return { ok: true, pick: enriched, provider: provider.id, output: delivered[0], outputs: delivered }
     }
     return { ok: false, reason: 'no-provider' }
   }

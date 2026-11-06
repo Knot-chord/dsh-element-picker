@@ -79,6 +79,15 @@ window.__ModuleLoader__.load({
       'padding:6px 12px;border-radius:8px;background:rgba(20,26,36,0.94);color:#e8f3ff;font-size:12px;',
       'border:1px solid rgba(120,200,255,0.35);opacity:0;pointer-events:none;transition:opacity .18s ease}',
       '.dsh-ep-toast[data-show]{opacity:1}',
+      '.dsh-ep-recent{position:fixed;z-index:2147483647;min-width:260px;max-width:420px;padding:6px;border-radius:8px;',
+      'background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);',
+      'box-shadow:0 12px 32px rgba(0,0,0,.35);font-size:12px;color:var(--dsw-alias-label-primary)}',
+      '.dsh-ep-recent-title{display:flex;justify-content:space-between;gap:8px;padding:2px 6px 6px;',
+      'color:var(--dsw-alias-label-tertiary);font-size:11px}',
+      '.dsh-ep-recent-row{display:block;width:100%;text-align:left;border:0;background:transparent;',
+      'border-radius:6px;padding:5px 8px;font:inherit;color:inherit;cursor:pointer;white-space:nowrap;',
+      'overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-ep-recent-row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
     ].join('')
 
     function installStyles() {
@@ -367,7 +376,26 @@ window.__ModuleLoader__.load({
       return KINDS[value] === undefined ? 'element' : value
     }
 
-    function glyphFor(kind) {
+    const DESKTOP_ICON =
+      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+      'stroke-linecap="round" stroke-linejoin="round">' +
+      '<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8M12 16v4"/></svg>'
+
+    const WEB_ICON =
+      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+      'stroke-linecap="round" stroke-linejoin="round">' +
+      '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.4 3.6 5.4 3.6 8.5s-1.2 6.1-3.6 8.5c-2.4-2.4-3.6-5.4-3.6-8.5S9.6 5.9 12 3.5z"/></svg>'
+
+    /** Chips carry where they came from: desktop control, browser DOM, or a file. */
+    function glyphFor(kind, source) {
+      if (kindOf(kind) === 'element') {
+        if (source === 'browser-cdp') {
+          return WEB_ICON.replace('width="16" height="16"', 'width="14" height="14"')
+        }
+        if (source === 'uia') {
+          return DESKTOP_ICON.replace('width="16" height="16"', 'width="14" height="14"')
+        }
+      }
       return KINDS[kindOf(kind)].glyph().replace('width="16" height="16"', 'width="14" height="14"')
     }
 
@@ -651,6 +679,7 @@ window.__ModuleLoader__.load({
             } catch (error) { /* caret placement is optional */ }
           }
         })
+        pushRecent(payload)
         return true
       } catch (error) {
         return false
@@ -868,6 +897,38 @@ window.__ModuleLoader__.load({
         // matching, so the toast never faded; remove it instead.
         if (toastNode !== null) delete toastNode.dataset.show
       }, holdMs)
+    }
+
+    /* ---------------------------------------------------------------- history */
+
+    const RECENT_KEY = 'dsh-element-picker:recent'
+    const RECENT_MAX = 10
+
+    function readRecent() {
+      try {
+        const raw = JSON.parse(window.localStorage.getItem(RECENT_KEY) || '[]')
+        return Array.isArray(raw) ? raw.slice(0, RECENT_MAX) : []
+      } catch (error) {
+        return []
+      }
+    }
+
+    function pushRecent(payload, text) {
+      try {
+        const entry = {
+          at: Date.now(),
+          label: payload.label || '',
+          kind: payload.kind || 'element',
+          source: payload.source || payload.provider || '',
+          payload,
+          text: text || fieldsOf(payload),
+        }
+        const list = readRecent().filter((item) => item.text !== entry.text)
+        list.unshift(entry)
+        window.localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, RECENT_MAX)))
+      } catch (error) {
+        /* private mode or quota: history is optional */
+      }
     }
 
     function copyText(text) {
@@ -1567,8 +1628,78 @@ window.__ModuleLoader__.load({
           }
           paint()
         })
+        button.addEventListener('contextmenu', (event) => {
+          event.preventDefault()
+          event.stopPropagation()
+          showRecent(button)
+        })
         place.host.insertBefore(button, place.before)
         paint()
+      }
+
+      /** Right click on the strip icon: re-insert one of the last ten references. */
+      let popup = null
+
+      function closeRecent() {
+        if (popup !== null && popup.parentNode) popup.parentNode.removeChild(popup)
+        popup = null
+      }
+
+      function showRecent(anchor) {
+        if (popup !== null) {
+          closeRecent()
+          return
+        }
+        const list = readRecent()
+        const box = document.createElement('div')
+        box.className = 'dsh-ep-recent'
+        const title = document.createElement('div')
+        title.className = 'dsh-ep-recent-title'
+        title.textContent = t('recent')
+        const clear = document.createElement('button')
+        clear.type = 'button'
+        clear.className = 'dsh-ep-recent-row'
+        clear.style.width = 'auto'
+        clear.textContent = t('recentClear')
+        clear.addEventListener('click', () => {
+          try {
+            window.localStorage.removeItem(RECENT_KEY)
+          } catch (error) { /* ignore */ }
+          closeRecent()
+        })
+        title.appendChild(clear)
+        box.appendChild(title)
+        if (list.length === 0) {
+          const empty = document.createElement('div')
+          empty.className = 'dsh-ep-recent-row'
+          empty.textContent = t('recentEmpty')
+          box.appendChild(empty)
+        }
+        for (const entry of list) {
+          const row = document.createElement('button')
+          row.type = 'button'
+          row.className = 'dsh-ep-recent-row'
+          row.textContent = entry.label || entry.text.split('\n')[0] || t('recentEmpty')
+          row.title = entry.text
+          row.addEventListener('click', () => {
+            closeRecent()
+            if (entry.payload && commitChip(entry.payload)) return
+            commitReference(entry.text)
+          })
+          box.appendChild(row)
+        }
+        const rect = anchor.getBoundingClientRect()
+        box.style.left = Math.max(8, Math.min(window.innerWidth - 300, rect.left - 200)) + 'px'
+        box.style.top = Math.max(8, rect.top - 8 - Math.min(360, 40 + list.length * 28)) + 'px'
+        document.body.appendChild(box)
+        popup = box
+        const dismiss = (event) => {
+          if (popup !== null && !popup.contains(event.target)) {
+            closeRecent()
+            document.removeEventListener('mousedown', dismiss, true)
+          }
+        }
+        document.addEventListener('mousedown', dismiss, true)
       }
 
       /**
@@ -1648,7 +1779,11 @@ window.__ModuleLoader__.load({
                 openedUrl: '已在侧栏打开这个链接',
                 copiedUrl: '链接已复制',
                 copiedPath: '路径已复制',
+                recent: '最近引用（右键图标打开）',
+                recentClear: '清空',
+                recentEmpty: '还没有引用过',
                 osPicked: '已引用外部控件：{label}',
+                cdpHint: '浏览器里的元素需要以 --remote-debugging-port=9222 启动（先完全退出浏览器再启动）',
                 osHint: '外部窗口 {hotkey}',
                 osHintToast: '外部窗口元素：按 {hotkey} 进入选取，点一下就会进输入框',
               },
@@ -1666,7 +1801,11 @@ window.__ModuleLoader__.load({
                 openedUrl: 'Opened the link in the sidebar',
                 copiedUrl: 'Link copied',
                 copiedPath: 'Path copied',
+                recent: 'Recent references (right-click the icon)',
+                recentClear: 'Clear',
+                recentEmpty: 'Nothing yet',
                 osPicked: 'Referenced external control: {label}',
+                cdpHint: 'Browser elements need --remote-debugging-port=9222 (quit the browser fully, then relaunch with it)',
                 osHint: 'outside window: {hotkey}',
                 osHintToast: 'Outside DSH: press {hotkey} to pick, click to insert',
               },
@@ -1786,11 +1925,28 @@ window.__ModuleLoader__.load({
           'dsh-element-picker: focus reporting',
         )
 
-        const HOTKEY_MODIFIERS = (event) =>
-          event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey
+        // The hotkey is whatever the host reports; the workspace default is only a
+        // fallback so the first paint works before /state answers.
+        let hotkeySpec = { ctrl: true, alt: true, shift: false, key: 'p' }
+        const parseHotkey = (text) => {
+          const parts = String(text || '')
+            .split('+')
+            .map((part) => part.trim().toLowerCase())
+            .filter(Boolean)
+          if (parts.length === 0) return
+          hotkeySpec = {
+            ctrl: parts.includes('ctrl') || parts.includes('control'),
+            alt: parts.includes('alt'),
+            shift: parts.includes('shift'),
+            key: parts[parts.length - 1],
+          }
+        }
         const onHotkey = (event) => {
-          if (!HOTKEY_MODIFIERS(event)) return
-          if (String(event.key).toLowerCase() !== 'p') return
+          const spec = hotkeySpec
+          if (String(event.key).toLowerCase() !== spec.key) return
+          if (Boolean(event.ctrlKey) !== spec.ctrl) return
+          if (Boolean(event.altKey) !== spec.alt) return
+          if (Boolean(event.shiftKey) !== spec.shift) return
           event.preventDefault()
           event.stopPropagation()
           if (picker.isActive()) picker.stop()
@@ -1810,7 +1966,7 @@ window.__ModuleLoader__.load({
         let osTimer = 0
         let osBusy = false
         const pollOsPick = async () => {
-          if (osBusy) return
+          if (osBusy) return false
           osBusy = true
           try {
             const response = await fetch('/element-picker/os/state?since=' + String(osRevision), {
@@ -1818,6 +1974,7 @@ window.__ModuleLoader__.load({
             })
             if (!response.ok) return
             const state = await response.json()
+            if (typeof state.hotkey === 'string') parseHotkey(state.hotkey)
             // The host restarts its revision counter on every mount; a stale local
             // counter would swallow every new pick.
             if (typeof state.generation === 'string' && state.generation !== osGeneration) {
@@ -1841,14 +1998,14 @@ window.__ModuleLoader__.load({
               const filePayload = { kind: 'file', label: fileLabel, path: pick.path }
               if (!commitChip(filePayload)) commitReference(mentionOf(pick.path))
               toast(t('osPicked').replace('{label}', fileLabel))
-              return
+              return true
             }
             if (pick.kind === 'url' && typeof pick.url === 'string' && pick.url !== '') {
               const urlLabel = String(pick.label || pick.url).trim().slice(0, 60)
               const urlPayload = { kind: 'url', label: urlLabel, url: pick.url }
               if (!commitChip(urlPayload)) commitReference(fieldsOf(urlPayload))
               toast(t('osPicked').replace('{label}', urlLabel))
-              return
+              return true
             }
             if (pick.cdp === true || pick.provider === 'browser-cdp' || pick.selector) {
               // A browser tab answered over the DevTools protocol (or a user provider
@@ -1864,7 +2021,7 @@ window.__ModuleLoader__.load({
               }
               if (!commitChip(domPayload)) commitReference(fieldsOf(domPayload))
               toast(t('osPicked').replace('{label}', domLabel))
-              return
+              return true
             }
             const control = [pick.controlType, pick.name].filter(Boolean).join(' · ')
             const label = (pick.windowOnly === true ? pick.windowTitle || control : control || pick.windowTitle || '')
@@ -1888,17 +2045,31 @@ window.__ModuleLoader__.load({
               },
             }
             if (!commitChip(payload)) commitReference(fieldsOf(payload))
-            toast(t('osPicked').replace('{label}', label))
+            // A browser window that could not be read means the DevTools port is off;
+            // say so instead of leaving the user with a window-level chip.
+            if (pick.cdpReason) toast(t('cdpHint'), 5000)
+            else toast(t('osPicked').replace('{label}', label))
+            return true
           } catch (error) {
             /* the host half may not be mounted yet */
           } finally {
             osBusy = false
           }
+          return false
         }
-        osTimer = setInterval(pollOsPick, 1200)
+        // Adaptive polling: brisk right after a pick, lazy when idle, paused-ish when the
+        // window is in the background.
+        let osFastUntil = 0
+        const loopOsPick = async () => {
+          const delivered = await pollOsPick()
+          if (delivered === true) osFastUntil = Date.now() + 5000
+          const delay = document.hidden ? 5000 : Date.now() < osFastUntil ? 700 : 1500
+          osTimer = setTimeout(loopOsPick, delay)
+        }
+        loopOsPick()
         ctx.effect(
           () => () => {
-            clearInterval(osTimer)
+            clearTimeout(osTimer)
             osTimer = 0
           },
           'dsh-element-picker: OS pick polling',
