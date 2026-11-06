@@ -1248,10 +1248,6 @@ window.__ModuleLoader__.load({
       let tip = null
       let active = false
       let hovered = null
-      /** What a click would reference right now (the climbed element). */
-      let current = null
-      /** Ctrl-clicked picks waiting to be merged into one chip. */
-      let pending = []
       let warnTimer = 0
       let scanTimer = 0
       const bound = new Map()
@@ -1272,26 +1268,9 @@ window.__ModuleLoader__.load({
         document.body.appendChild(tip)
       }
 
-      /**
-       * A preview frame the picker cannot enter: better-sidebar renders HTML
-       * previews (and sandboxed web pages) in an iframe WITHOUT `allow-same-origin`,
-       * so the frame gets an opaque origin and `contentDocument` is unreachable.
-       */
-      function blockedFrameOf(node) {
-        if (node === null || node.nodeType !== 1) return null
-        const tag = node.tagName
-        if (tag !== 'IFRAME' && tag !== 'FRAME') return null
-        try {
-          return node.contentDocument === null ? node : null
-        } catch (error) {
-          return node
-        }
-      }
-
       /** What else this hovered element can be referenced as, so the modifiers are visible. */
       function hoverExtras(node) {
         if (isNativeReferenceControl(node)) return [t('hintNative')]
-        if (blockedFrameOf(node) !== null) return [t('sandboxed')]
         const extras = []
         if (urlOf(node) !== null) extras.push(t('hintLink'))
         const file = pathOf(node)
@@ -1360,146 +1339,48 @@ window.__ModuleLoader__.load({
       }
 
       function onMove(event, doc) {
-        try {
-          onMoveInner(event, doc)
-        } catch (error) {
-          console.warn('[element-picker] move failed', error)
-        }
-      }
-
-      function onMoveInner(event, doc) {
         const next = targetOf(event, doc)
         if (next !== null && next.tagName === 'WEBVIEW') {
-          // The guest page has its own agent and paints its own outline; only drop the
-          // app-side element so a click cannot reuse it. Do not repaint here — that
-          // would wipe the guest's box and tip on every move.
           hovered = null
-          current = null
           return
         }
         if (next === hovered) return
         hovered = next
-        // Hovering shows what the user probably means (the button, the row) rather than
-        // the innermost span; the arrows still let them walk the tree either way.
-        current = next === null ? null : meaningfulAncestor(next)
-        paint(current)
-      }
-
-      function commitPicked(element, options = {}) {
-        if (element === null) return false
-        const wanted = options.kind ?? 'element'
-        let payload = null
-        try {
-          payload = buildPayload(wanted, element, element.ownerDocument === document ? location.href : '')
-        } catch (error) {
-          payload = null
-        }
-        if (payload === null) return false
-        if (options.multi === true) {
-          pending.push(payload)
-          paint(element)
-          ensureUi()
-          warn(t('multiSelected').replace('{n}', String(pending.length)))
-          return true
-        }
-        const reference = fieldsOf(payload)
-        payload.clipboard = reference
-        if (commitChip(payload)) return true
-        if (payload.kind === 'file' && payload.path && commitReference(mentionOf(payload.path))) return true
-        return commitReference(reference)
-      }
-
-      /** One chip for several picks: the selector list stays readable. */
-      function commitPending() {
-        if (pending.length === 0) return false
-        const payload = {
-          kind: 'element',
-          label: pending.length + ' 个元素',
-          selector: pending.map((item) => item.selector).join(' | '),
-          page: pending[0].page,
-          text: pending.map((item) => item.text || item.label).join(' / ').slice(0, 200),
-        }
-        const reference = fieldsOf(payload)
-        payload.clipboard = reference
-        pending = []
-        return commitChip(payload) || commitReference(reference)
+        paint(next)
       }
 
       function onClick(event, doc) {
-        try {
-          onClickInner(event, doc)
-        } catch (error) {
-          console.warn('[element-picker] click failed', error)
-        }
-      }
-
-      function onClickInner(event, doc) {
         const target = targetOf(event, doc)
         if (target === null) return
         if (isNativeReferenceControl(target)) return
         event.preventDefault()
         event.stopPropagation()
-        // A sandboxed preview keeps its DOM on an opaque origin: nothing can be
-        // read inside it, so say what to switch instead of picking the frame.
-        if (blockedFrameOf(target) !== null) {
-          ensureUi()
-          warn(t('sandboxedHint'))
-          return
+        let payload = null
+        try {
+          const wanted = event.altKey ? 'url' : event.shiftKey ? 'file' : 'element'
+          payload = buildPayload(wanted, target, doc === document ? location.href : '')
+        } catch (error) {
+          payload = null
         }
-        // Ctrl adds to the pending set and keeps picking; a plain click finishes.
-        if (event.ctrlKey) {
-          hovered = target
-          current = meaningfulAncestor(target)
-          commitPicked(current, { multi: true })
-          return
-        }
-        const wanted = event.altKey ? 'url' : event.shiftKey ? 'file' : 'element'
-        const element = wanted === 'element' ? (current ?? meaningfulAncestor(target)) : target
         hovered = null
         stop()
-        if (commitPicked(element, { kind: wanted })) return
+        if (payload !== null) {
+          const reference = fieldsOf(payload)
+          payload.clipboard = reference
+          if (commitChip(payload)) return
+          // No chip possible: a file still has its native text form.
+          if (payload.kind === 'file' && payload.path && commitReference(mentionOf(payload.path))) return
+          if (commitReference(reference)) return
+        }
         ensureUi()
-        warn(t('noComposer'))
+        warn(payload === null ? t('pickFailed') : t('noComposer'))
       }
 
       function onKey(event) {
-        try {
-          onKeyInner(event)
-        } catch (error) {
-          console.warn('[element-picker] key failed', error)
-        }
-      }
-
-      function onKeyInner(event) {
-        if (!active) return
-        if (event.key === 'Escape') {
-          event.preventDefault()
-          event.stopPropagation()
-          stop()
-          return
-        }
-        if (event.key === 'Enter') {
-          event.preventDefault()
-          event.stopPropagation()
-          if (pending.length > 0) {
-            commitPending()
-            stop()
-          } else if (current !== null) {
-            const element = current
-            stop()
-            commitPicked(element)
-          }
-          return
-        }
-        if (event.key === 'ArrowUp' || event.key === 'ArrowDown') {
-          event.preventDefault()
-          event.stopPropagation()
-          const anchor = current ?? hovered
-          if (anchor === null) return
-          current = event.key === 'ArrowUp' ? climb(anchor, 1) : anchor
-          if (event.key === 'ArrowDown' && hovered !== null && hovered !== anchor) current = hovered
-          paint(current)
-        }
+        if (event.key !== 'Escape' || !active) return
+        event.preventDefault()
+        event.stopPropagation()
+        stop()
       }
 
       function bindDocument(doc) {
@@ -1663,11 +1544,9 @@ window.__ModuleLoader__.load({
         ensureUi()
         active = true
         hovered = null
-        current = null
-        pending = []
         viewHover = null
         startedViews.clear()
-        tip.textContent = t('hintKeys')
+        tip.textContent = t('hint')
         delete tip.dataset.warn
         tip.style.left = '16px'
         tip.style.top = '16px'
@@ -1675,9 +1554,6 @@ window.__ModuleLoader__.load({
         scan()
         scanTimer = setInterval(scan, 1000)
         viewTimer = setInterval(pollWebviews, 150)
-        // Esc must always leave picking, even when the focused document is a frame the
-        // per-document listeners did not reach (a webview, a portaled dialog).
-        window.addEventListener('keydown', onKey, true)
         pollWebviews()
       }
 
@@ -1685,7 +1561,6 @@ window.__ModuleLoader__.load({
         if (!active) return
         active = false
         hovered = null
-        current = null
         clearInterval(scanTimer)
         scanTimer = 0
         clearInterval(viewTimer)
@@ -1699,7 +1574,6 @@ window.__ModuleLoader__.load({
         pollBusy = false
         lastGuestKey = ''
         unbindAll()
-        window.removeEventListener('keydown', onKey, true)
         if (warnTimer === 0 && tip !== null) tip.style.display = 'none'
         if (box !== null) box.style.display = 'none'
       }
