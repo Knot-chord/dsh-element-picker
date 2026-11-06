@@ -162,6 +162,16 @@ export function apply(ctx, config = {}) {
         return
       }
 
+      // The web client reports whether its window has focus: while it does, the client
+      // owns the hotkey and the native helper must stay out of the way.
+      if (url.pathname === `${ROUTE}/focus` && req.method === 'POST') {
+        const body = await readJson(req)
+        ui.focused = body.focused === true
+        ui.focusedAt = Date.now()
+        sendJson(res, 200, { ok: true, focused: ui.focused })
+        return
+      }
+
       if (url.pathname === `${ROUTE}/state` && req.method === 'GET') {
         health.polls += 1
         const since = Number(url.searchParams.get('since') ?? '0')
