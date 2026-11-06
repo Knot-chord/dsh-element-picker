@@ -7,7 +7,8 @@ param(
     [switch]$Select,
     [string]$LockPath = '',
     [string]$Point = '',
-    [string]$Language = 'zh'
+    [string]$Language = 'zh',
+    [switch]$NoLock
 )
 
 # os-pick.ps1 - press the hotkey to enter selection mode: move the pointer to see the
@@ -20,7 +21,7 @@ $ErrorActionPreference = 'Stop'
 # overlays and swallow each other's clicks. The lock file is held OPEN for the whole
 # process lifetime (FileShare.None), so a second helper cannot even read it while the
 # owner lives; a file left by a crashed helper is reclaimed.
-if ($Point -eq '' -and -not $Once -and -not $PostOnce) {
+if ($Point -eq '' -and -not $Once -and -not $PostOnce -and -not $NoLock) {
 if ([string]::IsNullOrEmpty($LockPath)) { $LockPath = Join-Path $env:TEMP 'dsh-element-picker.helper.lock' }
 $lockPath = $LockPath
 $lockStream = $null
@@ -330,71 +331,80 @@ function Try-Resolve($point, $window) {
     }
 }
 
+# The outline is four thin topmost windows plus a small hint window. A single
+# full-screen layered window with a transparency key is the usual trick, but it costs
+# a whole-surface repaint per move and can stall on a multi-monitor setup.
 function New-Overlay {
-    $form = New-Object System.Windows.Forms.Form
-    $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-    $form.StartPosition = 'Manual'
-    $form.Bounds = [System.Windows.Forms.SystemInformation]::VirtualScreen
-    $form.TopMost = $true
-    $form.ShowInTaskbar = $false
-    $form.BackColor = [System.Drawing.Color]::Fuchsia
-    $form.TransparencyKey = [System.Drawing.Color]::Fuchsia
-    $form.Cursor = [System.Windows.Forms.Cursors]::Cross
-    $form.Show()
-    $style = [OsPickWin32]::GetWindowLong($form.Handle, $GWL_EXSTYLE)
-    [void][OsPickWin32]::SetWindowLong($form.Handle, $GWL_EXSTYLE, ($style -bor $WS_EX_TRANSPARENT -bor $WS_EX_TOOLWINDOW))
-    [void][OsPickWin32]::SetWindowPos($form.Handle, [IntPtr]::Zero, 0, 0, 0, 0, $SWP_FLAGS)
-    return $form
+    $accent = [System.Drawing.Color]::FromArgb(255, 76, 141, 255)
+    $borders = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt 4; $i++) {
+        $form = New-Object System.Windows.Forms.Form
+        $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+        $form.StartPosition = 'Manual'
+        $form.ShowInTaskbar = $false
+        $form.TopMost = $true
+        $form.BackColor = $accent
+        $form.Size = New-Object System.Drawing.Size(1, 1)
+        $form.Show()
+        [void]$borders.Add($form)
+    }
+    $hintForm = New-Object System.Windows.Forms.Form
+    $hintForm.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+    $hintForm.StartPosition = 'Manual'
+    $hintForm.ShowInTaskbar = $false
+    $hintForm.TopMost = $true
+    $hintForm.BackColor = [System.Drawing.Color]::FromArgb(18, 26, 40)
+    $hintLabel = New-Object System.Windows.Forms.Label
+    $hintLabel.AutoSize = $true
+    $hintLabel.ForeColor = [System.Drawing.Color]::White
+    $hintLabel.Font = New-Object System.Drawing.Font('Microsoft YaHei UI', 9)
+    $hintLabel.Location = New-Object System.Drawing.Point(6, 4)
+    $hintForm.Controls.Add($hintLabel)
+    $hintForm.Show()
+    return @{ borders = $borders; hint = $hintForm; label = $hintLabel }
 }
 
-function Set-Highlight($form, $rect, [string]$label, $previous) {
-    $form.Tag = @{ rect = $rect; label = $label }
-    $region = $null
-    if ($null -ne $rect) {
-        $region = New-Object System.Drawing.Region((New-Object System.Drawing.Rectangle(($rect.X - 2), ($rect.Y - 2), ($rect.Width + 4), ($rect.Height + 4))))
+function Hide-Overlay($overlay) {
+    foreach ($form in $overlay.borders) { $form.Visible = $false }
+    $overlay.hint.Visible = $false
+}
+
+function Close-Overlay($overlay) {
+    foreach ($form in $overlay.borders) {
+        try { $form.Close() } catch { }
+        $form.Dispose()
     }
-    if ($null -ne $previous) {
-        $old = New-Object System.Drawing.Region((New-Object System.Drawing.Rectangle(($previous.X - 2), ($previous.Y - 2), ($previous.Width + 4), ($previous.Height + 4))))
-        if ($null -eq $region) { $region = $old } else { $region.Union($old) }
+    try { $overlay.hint.Close() } catch { }
+    $overlay.hint.Dispose()
+}
+
+function Set-Highlight($overlay, $rect, [string]$label, $previous) {
+    $overlay.label.Text = $label
+    $size = $overlay.label.PreferredSize
+    $overlay.hint.Size = New-Object System.Drawing.Size(($size.Width + 12), ($size.Height + 8))
+    if ($null -eq $rect -or $rect.Width -le 0 -or $rect.Height -le 0) {
+        foreach ($form in $overlay.borders) { $form.Visible = $false }
+        $overlay.hint.Location = New-Object System.Drawing.Point(24, 24)
+        $overlay.hint.Visible = $true
+        return
     }
-    if ($null -eq $region) { $form.Invalidate() } else { $form.Invalidate($region) }
+    $thickness = 2
+    $overlay.borders[0].Bounds = New-Object System.Drawing.Rectangle($rect.X, $rect.Y, $rect.Width, $thickness)
+    $overlay.borders[1].Bounds = New-Object System.Drawing.Rectangle($rect.X, ($rect.Y + $rect.Height - $thickness), $rect.Width, $thickness)
+    $overlay.borders[2].Bounds = New-Object System.Drawing.Rectangle($rect.X, $rect.Y, $thickness, $rect.Height)
+    $overlay.borders[3].Bounds = New-Object System.Drawing.Rectangle(($rect.X + $rect.Width - $thickness), $rect.Y, $thickness, $rect.Height)
+    foreach ($form in $overlay.borders) { if (-not $form.Visible) { $form.Visible = $true } }
+    $overlay.hint.Location = New-Object System.Drawing.Point([Math]::Max(0, $rect.X), [Math]::Max(0, ($rect.Y - 24)))
+    if (-not $overlay.hint.Visible) { $overlay.hint.Visible = $true }
 }
 
 function Start-Selection {
     $overlay = New-Overlay
-    $hint = if ($Language -eq 'en') { 'Move the pointer and click to pick  -  right click / Esc cancels' } else { '移动鼠标并点击选取  ·  右键 / Esc 取消' }
-    $overlay.Tag = @{ rect = $null; label = $hint }
-    $overlay.Add_Paint({
-            param($sender, $eventArgs)
-            $state = $sender.Tag
-            if ($null -eq $state) { return }
-            $graphics = $eventArgs.Graphics
-            $pen = New-Object System.Drawing.Pen([System.Drawing.Color]::FromArgb(255, 76, 141, 255), 2)
-            $fill = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(235, 18, 26, 40))
-            $textBrush = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::White)
-            $font = New-Object System.Drawing.Font('Segoe UI', 9)
-            try {
-                $rect = $state.rect
-                if ($null -ne $rect -and $rect.Width -gt 0 -and $rect.Height -gt 0) {
-                    $graphics.DrawRectangle($pen, $rect.X, $rect.Y, $rect.Width, $rect.Height)
-                }
-                if (-not [string]::IsNullOrEmpty($state.label)) {
-                    if ($null -ne $rect) {
-                        $px = $rect.X
-                        $py = [Math]::Max(0, $rect.Y - 24)
-                    } else {
-                        $px = 24
-                        $py = 24
-                    }
-                    $size = $graphics.MeasureString($state.label, $font)
-                    $graphics.FillRectangle($fill, $px, $py, ([int]$size.Width + 14), 22)
-                    $graphics.DrawString($state.label, $font, $textBrush, ($px + 6), ($py + 3))
-                }
-            } finally {
-                $pen.Dispose(); $fill.Dispose(); $textBrush.Dispose(); $font.Dispose()
-            }
-        })
-    $overlay.Show()
+    # Chinese lives as base64 on purpose: Windows PowerShell 5.1 reads a BOM-less file
+    # as ANSI, so any non-ASCII literal would arrive as mojibake.
+    $hintZh = [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('56e75Yqo6byg5qCH5bm254K55Ye76YCJ5Y+WICDCtyAg5Y+z6ZSuIC8gRXNjIOWPlua2iA=='))
+    $hint = if ($Language -eq 'en') { 'Move the pointer and click to pick  -  right click / Esc cancels' } else { $hintZh }
+    Set-Highlight $overlay $null $hint $null
     [void][OsPickWin32]::Start()
 
     $hoverRect = $null
@@ -406,12 +416,17 @@ function Start-Selection {
     $lastPoint = $null
     $lastMoveAt = $stopwatch.ElapsedMilliseconds
 
+    $loopCount = 0
     while ($true) {
+        $loopCount += 1
         [System.Windows.Forms.Application]::DoEvents()
         if ([OsPickWin32]::Cancelled) { break }
         if (([OsPickWin32]::GetAsyncKeyState($ESC) -band 0x8000) -ne 0) { break }
 
         $cursor = Get-CursorPoint
+        if ($env:DSH_PICK_DEBUG -and $loopCount -le 3) {
+            Write-Output ('iter ' + $loopCount + ' cursor=' + (($cursor | ConvertTo-Json -Compress)) + ' last=' + (($lastPoint | ConvertTo-Json -Compress)))
+        }
         if ($null -ne $cursor) {
             $pointKey = '{0}:{1}' -f $cursor.x, $cursor.y
             if ($null -eq $lastPoint -or $lastPoint.x -ne $cursor.x -or $lastPoint.y -ne $cursor.y) {
@@ -423,6 +438,7 @@ function Start-Selection {
             } elseif ($pointKey -ne $resolvedFor -and ($stopwatch.ElapsedMilliseconds - $lastMoveAt) -ge 70) {
                 $resolvedFor = $pointKey
                 $pick = Get-Pick $cursor.x $cursor.y
+                if ($env:DSH_PICK_DEBUG) { Write-Output ('hover ' + $pointKey + ' null=' + ($null -eq $pick)) }
                 if ($null -ne $pick) {
                     $box = $pick.bounds
                     $rect = New-Object System.Drawing.Rectangle($box.x, $box.y, $box.w, $box.h)
@@ -441,7 +457,7 @@ function Start-Selection {
         if ([OsPickWin32]::Clicked) {
             $cursor = Get-CursorPoint
             if ($null -ne $cursor) {
-                $overlay.Hide()
+                Hide-Overlay $overlay
                 [System.Windows.Forms.Application]::DoEvents()
                 Start-Sleep -Milliseconds 40
 
@@ -455,7 +471,7 @@ function Start-Selection {
 
                 # Fast path: a Chromium window cannot answer for its DOM, so hand that one
                 # pick to the tab over CDP (the host queues the result). Everything else is
-                # resolved right here with UI Automation — no extra process per click.
+                # resolved right here with UI Automation - no extra process per click.
                 if ($rootClass -match 'Chrome_WidgetWin') {
                     $cdp = Try-CdpPick $rootTitle
                     if ($cdp -and $cdp.ok -eq $true) {
@@ -481,8 +497,7 @@ function Start-Selection {
     }
 
     [void][OsPickWin32]::Stop()
-    $overlay.Hide()
-    $overlay.Dispose()
+    Close-Overlay $overlay
     return $result
 }
 
