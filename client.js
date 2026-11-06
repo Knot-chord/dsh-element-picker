@@ -1420,6 +1420,9 @@ window.__ModuleLoader__.load({
         scan()
         scanTimer = setInterval(scan, 1000)
         viewTimer = setInterval(pollWebviews, 150)
+        // Esc must always leave picking, even when the focused document is a frame the
+        // per-document listeners did not reach (a webview, a portaled dialog).
+        window.addEventListener('keydown', onKey, true)
         pollWebviews()
       }
 
@@ -1440,6 +1443,7 @@ window.__ModuleLoader__.load({
         pollBusy = false
         lastGuestKey = ''
         unbindAll()
+        window.removeEventListener('keydown', onKey, true)
         if (warnTimer === 0 && tip !== null) tip.style.display = 'none'
         if (box !== null) box.style.display = 'none'
       }
@@ -1758,6 +1762,46 @@ window.__ModuleLoader__.load({
         window.__dshElementPicker = { commitChip, commitReference }
         strip.start()
         patchChipDecorate()
+
+        // The global hotkey runs the SAME picker the strip icon runs, and only while this
+        // window has focus — the native helper defers to us and takes over otherwise.
+        const reportFocus = (focused) => {
+          fetch('/element-picker/os/focus', {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ focused }),
+          }).catch(() => {})
+        }
+        const onWindowFocus = () => reportFocus(true)
+        const onWindowBlur = () => reportFocus(false)
+        window.addEventListener('focus', onWindowFocus)
+        window.addEventListener('blur', onWindowBlur)
+        if (document.hasFocus()) reportFocus(true)
+        ctx.effect(
+          () => () => {
+            window.removeEventListener('focus', onWindowFocus)
+            window.removeEventListener('blur', onWindowBlur)
+            reportFocus(false)
+          },
+          'dsh-element-picker: focus reporting',
+        )
+
+        const HOTKEY_MODIFIERS = (event) =>
+          event.ctrlKey && event.altKey && !event.shiftKey && !event.metaKey
+        const onHotkey = (event) => {
+          if (!HOTKEY_MODIFIERS(event)) return
+          if (String(event.key).toLowerCase() !== 'p') return
+          event.preventDefault()
+          event.stopPropagation()
+          if (picker.isActive()) picker.stop()
+          else picker.start()
+          strip.paint()
+        }
+        window.addEventListener('keydown', onHotkey, true)
+        ctx.effect(
+          () => () => window.removeEventListener('keydown', onHotkey, true),
+          'dsh-element-picker: hotkey',
+        )
 
         // Elements outside DSH: the native helper posts what sits under the mouse
         // when the global hotkey fires, and this loop turns it into a chip.

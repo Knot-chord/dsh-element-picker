@@ -463,6 +463,17 @@ function Test-Down([int]$vkey) {
     return (([OsPickWin32]::GetAsyncKeyState($vkey) -band 0x8000) -ne 0)
 }
 
+# The web client also binds this hotkey while its window has focus. Ask the host so
+# exactly one of them opens a picker.
+function Test-ClientFocused {
+    try {
+        $state = Invoke-RestMethod -Method Get -Uri (($BaseUrl.TrimEnd('/')) + '/element-picker/os/state?since=999999') -TimeoutSec 3
+        return ($state.clientFocused -eq $true)
+    } catch {
+        return $false
+    }
+}
+
 function Test-Hotkey {
     $down = (Test-Down $vk)
     if ($wantCtrl) { $down = $down -and (Test-Down $VK_CONTROL) }

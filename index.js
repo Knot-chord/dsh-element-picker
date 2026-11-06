@@ -110,6 +110,8 @@ export function apply(ctx, config = {}) {
     }
   }
   const health = { helper: false, error: '', hotkey, startedAt: 0, polls: 0 }
+  /** True while the DSH window has focus: the client handles the hotkey itself then. */
+  const ui = { focused: false, focusedAt: 0 }
 
   const handler = async (req, res) => {
     try {
@@ -172,6 +174,7 @@ export function apply(ctx, config = {}) {
           helper: health.helper,
           error: health.error,
           polls: health.polls,
+          clientFocused: ui.focused,
           pick: fresh ? state.pick : null,
         })
         return
