@@ -146,7 +146,19 @@ export function apply(ctx, config = {}) {
       try {
         child = spawn(
           POWERSHELL,
-          ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', script, '-BaseUrl', origin, '-Hotkey', hotkey],
+          [
+            '-NoProfile',
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            script,
+            '-BaseUrl',
+            origin,
+            '-Hotkey',
+            hotkey,
+            '-LockPath',
+            join(dirname(script), '..', 'os-pick.lock'),
+          ],
           { windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] },
         )
       } catch (error) {
@@ -161,10 +173,16 @@ export function apply(ctx, config = {}) {
       child.stderr?.on('data', (chunk) => {
         health.error = String(chunk).trim().slice(0, 200)
       })
-      child.on('exit', () => {
+      child.on('exit', (code) => {
         if (liveHelper === child) liveHelper = null
         child = null
         health.helper = false
+        // 3 = another instance of this plugin already owns the hotkey; retrying would
+        // only spin a process every few seconds.
+        if (code === 3) {
+          health.error = 'another element-picker helper is already running'
+          return
+        }
         if (!stopped) restart = setTimeout(start, 4000)
       })
     }

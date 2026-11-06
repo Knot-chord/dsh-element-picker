@@ -13,14 +13,50 @@ param(
 $ErrorActionPreference = 'Stop'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 
-# Single instance: two helpers would open two overlays and swallow each other's
-# clicks. The named mutex is released by the OS when this process exits.
-$pickerMutex = New-Object System.Threading.Mutex($false, 'Global\DshElementPickerOsPick')
-if (-not $pickerMutex.WaitOne(0)) {
-    Write-Output 'another helper is already running'
+# Single instance across every DSH host on this machine: two helpers would open two
+# overlays and swallow each other's clicks. The lock file is held OPEN for the whole
+# process lifetime (FileShare.None), so a second helper cannot even read it while the
+# owner lives; a file left by a crashed helper is reclaimed.
+if ([string]::IsNullOrEmpty($LockPath)) { $LockPath = Join-Path $env:TEMP 'dsh-element-picker.helper.lock' }
+$lockPath = $LockPath
+$lockStream = $null
+for ($attempt = 0; $attempt -lt 4 -and $null -eq $lockStream; $attempt++) {
+    try {
+        $lockStream = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::CreateNew, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    } catch {
+        $alive = $true
+        try {
+            $probe = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+            $reader = New-Object System.IO.StreamReader($probe)
+            $raw = $reader.ReadToEnd()
+            $reader.Close()
+            $probe.Close()
+            if ($raw -ne '') {
+                $lock = $raw | ConvertFrom-Json
+                $holder = Get-Process -Id ([int]$lock.pid) -ErrorAction SilentlyContinue
+                if ($null -ne $holder -and $holder.StartTime.Ticks -eq [long]$lock.start) { $alive = $true } else { $alive = $false }
+            } else {
+                $alive = $false
+            }
+        } catch {
+            # Cannot open it: the owner still holds it.
+            $alive = $true
+        }
+        if ($alive) {
+            Write-Output 'another helper is already running'
+            exit 3
+        }
+        Remove-Item $lockPath -Force -ErrorAction SilentlyContinue
+    }
+}
+if ($null -eq $lockStream) {
+    Write-Output 'could not acquire the helper lock'
     exit 3
 }
-
+$payload = ConvertTo-Json @{ pid = $PID; start = (Get-Process -Id $PID).StartTime.Ticks }
+$lockBytes = [System.Text.Encoding]::ASCII.GetBytes($payload)
+$lockStream.Write($lockBytes, 0, $lockBytes.Length)
+$lockStream.Flush()
 Add-Type -AssemblyName WindowsBase
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
