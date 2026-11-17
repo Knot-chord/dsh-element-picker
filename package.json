@@ -1,6 +1,6 @@
 {
   "name": "dsh-element-picker",
-  "version": "0.10.2",
+  "version": "0.10.3",
   "description": "Reference chips: one strip icon in the right sidebar turns elements, links and file paths into native composer chips — pick from DSH itself, same-origin frames, or the sidebar browser's webview guests; the chips serialize into the prompt and point back at what they name.",
   "type": "module",
   "main": "./index.js",
@@ -15,6 +15,8 @@
     "cdp.js",
     "protocols.js",
     "PROTOCOL.md",
+    "README.md",
+    "LICENSE",
     "scripts/check-pack.mjs",
     "scripts/e2e.mjs",
     "cordis.patch.yml",
@@ -36,11 +38,22 @@
     "prepublishOnly": "node scripts/check-pack.mjs",
     "e2e": "node scripts/e2e.mjs"
   },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sakikoTGW/dsh-element-picker.git"
+  },
+  "homepage": "https://github.com/sakikoTGW/dsh-element-picker#readme",
+  "bugs": {
+    "url": "https://github.com/sakikoTGW/dsh-element-picker/issues"
+  },
+  "author": "sakikoTGW",
   "license": "MIT",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "cordis",
-    "deepseek-harness"
+    "deepseek-harness",
+    "element-picker",
+    "reference-chip"
   ]
 }
