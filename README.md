@@ -8,9 +8,7 @@ DeepSeek Harness 插件：**点一下，就能引用一个元素**——DSH 自�
 ![deps](https://img.shields.io/badge/dependencies-0-brightgreen)
 ![license](https://img.shields.io/badge/license-MIT-lightgrey)
 
-> **承接关系**：本插件是 [dsh-element-picker](https://www.npmjs.com/package/dsh-element-picker)（作者 **sakikoTGW**，MIT）的**接续实现**——同一问题域、独立重写。
-> 上游先行，功劳归他；代码级重合约 8%（集中在 DSH 平台样板），差异见[与上游的关系](#与上游的关系)。
-> 本实现经上游作者同意，以 PR 形式提交；合并后成为该仓库的一部分。上游先行，credit 归 sakikoTGW。
+> 上游：[dsh-element-picker](https://www.npmjs.com/package/dsh-element-picker)（作者 **sakikoTGW**，MIT）。本实现是同一问题域的独立重写，上游先行，credit 归他；详见 [NOTICE](NOTICE)。
 
 ## 三个地方，三个用途
 
@@ -205,39 +203,6 @@ chip 态（`referenceStyle: chip`）才带 `[引用元素]` 首行标记。
 - **无常驻提示词、不新增工具**：插件不往系统提示里加任何内容，模型侧成本只有你主动插入的引用块。
 - 引用块默认 ≤ **520 字符**（`textBudget`），`standard` 档典型 200–260 字符；超预算按价值从低到高整行丢弃，不截断关键行。
 - 降级/失败提示只走 toast，**不进对话、不进输入框**。
-
-## 与上游的关系
-
-上游是 **dsh-element-picker 0.10.2**（sakikoTGW，MIT）。我们是同一问题域的**独立重写**，不是它的 fork。
-
-用 5-token 指纹（shingle）对两边全部运行时 JS 做量化对比：
-
-| 文件对 | 行数（我们 / 他） | 行集合重合 | 5-token 指纹重合 |
-|---|---|---|---|
-| client.js | 1171 / 1348 | 4.1% | 8.7% |
-| index.js | 443 / 192 | 5.8% | 9.4% |
-| cdp.js | 241 / 253 | 1.2% | 4.4% |
-| 全部运行时 JS | 3295 / 2303 | **3.6%** | **8.2%** |
-
-那 8% 是 DSH 平台强制的写法，不是他的特色实现，例如：
-
-```
-() => ctx.webServer.register({ kind: 'prefix', path: ROUTE, handler })
-return address === '127.0.0.1' || address === '::1' || address === '::ffff:127.0.0.1'
-res.setHeader('Content-Type', 'application/json; charset=utf-8')
-```
-
-**架构差异**：
-
-| 维度 | 上游 0.10.2 | 本插件 |
-|---|---|---|
-| 取元素通道 | provider/output 协议表 + PowerShell/UIA 原生通道（`protocols.js`、`native/os-pick.ps1`） | 一个注入内核 + 四通道（DSH / webview / CDP / 扩展） |
-| 插入输入框 | 原生 chip | 四级降级：引用卡 → chip → 纯文本 → 剪贴板 |
-| 元素信息 | 固定字段表 | 六层提取（目标 / 身份 / 位置 / 内容 / 重找 / 预算） |
-| 失败可见性 | — | 页面内 `lastError` + toast「引用失败：原因」 |
-| 跨版本 | — | 能力探测 + `engines.dsh` 声明 + 兼容矩阵 |
-
-**诚实披露**：早期阅读上游代码时沿用了少量命名（`BUTTON_ID`、`RECENT_KEY`、`RECENT_MAX`、`installStyles`、`parsePayload`、`NS`）。它们是命名习惯，不是复制的实现。详见 [NOTICE](NOTICE)。
 
 ## 局限
 
