@@ -1,6 +1,32 @@
+# dsh-element-ref — the Host row. Values here are defaults; your own patch
+# layer can override any of them without touching the installed package.
 - insert:
-    - id: element-picker
-      name: 'dsh-element-picker'
+    - id: element-ref
+      name: 'dsh-element-ref'
       config:
-        hotkey: 'Ctrl+Alt+P'
-        external: false
+        enabled: true
+        # Take over the browser dsh-ego-browser started (its state dir is read).
+        agentBrowser: true
+        # auto: attach to an already-debuggable browser, else use the plugin-managed
+        # one; off: never touch an external browser.
+        edge: auto
+        edgeExecutable: ''
+        # Non-empty replaces the plugin-managed profile. Pointing this at the real
+        # Edge "User Data" folder requires Edge to be fully closed first.
+        edgeProfileDir: ''
+        attachPorts:
+          - 9222
+          - 9223
+        sessionTtlMs: 120000
+        maxTargets: 12
+        # Reference block detail: compact | standard | full, and the character budget
+        # the composer's codec composes within (the model pays for it).
+        textDetail: standard
+        textBudget: 520
+        # Companion browser extension bridge: a fixed loopback port the extension polls.
+        extension: true
+        extensionPort: 45917
+        # How a pick enters the composer: quote = DSH's own quote card (no "@"),
+        # chip = a reference chip in the composer.
+        referenceStyle: quote
+

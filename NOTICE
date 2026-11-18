@@ -1,0 +1,26 @@
+dsh-element-ref — upstream notice
+
+This project is a successor implementation of dsh-element-picker
+(https://www.npmjs.com/package/dsh-element-picker, version 0.10.2),
+published by sakikoTGW and declared MIT in its package.json.
+
+Upstream came first. Credit for the original idea, the problem framing and the
+prior work is theirs. The upstream tarball ships no LICENSE file; its MIT
+declaration is honored here by attribution rather than by copying a notice
+file that does not exist.
+
+Our implementation is independent. Measured against upstream 0.10.2 with
+5-token shingles over the whole runtime JavaScript, textual overlap is about
+8% (line-set overlap about 4%), concentrated in statements forced by the DSH
+plugin API (registering a prefix route, loopback address checks, JSON response
+headers, DSH CSS variables).
+
+A small number of identifier names were inherited from reading the upstream
+code early on: BUTTON_ID, RECENT_KEY, RECENT_MAX, installStyles, parsePayload,
+NS. They are naming habits, not copied implementations.
+
+Upstream architecture: provider/output protocol tables plus a PowerShell/UIA
+native channel (protocols.js, native/os-pick.ps1).
+Our architecture: one injected kernel shared by four channels, a four-step
+insertion fallback (quote card -> chip -> plain text -> clipboard), and a
+six-layer element description model.

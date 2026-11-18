@@ -1,2153 +1,1840 @@
 /**
- * dsh-element-picker — 「引用」。
+ * dsh-element-ref — the browser half.
  *
- * 右侧面板顶栏一个图标：点一下进入选取，鼠标划过哪个元素就框出哪个，点一下把它
- * 变成输入框里的原生引用 chip。⌥ 点取元素上的链接，⇧ 点取它携带的文件路径。
+ * One icon in the right sidebar's top-right control cluster starts a pick
+ * session. A pick can then happen in DSH itself, in a sidebar browser page, in
+ * the DSH agent browser, or in an external Edge/Chrome window — every surface
+ * runs the same in-page agent (`agent.source.js`, served by the Host half), and
+ * every result becomes a real composer reference chip through the composer's
+ * own `slash/input-insert-reference` event.
  *
- * 选取范围：DSH 自己的界面（含右侧面板）、同源 iframe（逐层 >>> 进去）、以及
- * 侧栏浏览器里的任意网页（Electron <webview>，用 executeJavaScript 在 guest 内部
- * 工作，跨源也能取）。
- *
- * chip 用 composer 自己的 ReferenceChipNode；提交时由我们注册的引用源 codec 展开成
- * 模型文本；点击 chip 回到元素/链接/路径。没有常驻面板、不起端口、不依赖扩展。
+ * @module dsh-element-ref/client
  */
 window.__ModuleLoader__.load({
-  id: 'dsh-element-picker',
+  id: 'dsh-element-ref',
   factory(require) {
     const React = require('react')
-    const NS = 'dsh-element-picker'
-    const BUTTON_ID = 'dsh-element-pick-btn'
-    const FRAME_SEP = ' >>> '
+    const NS = 'dsh-element-ref'
+    const ROUTE = '/element-ref'
+    const SOURCE = 'element-ref'
+    const BUTTON_ID = 'dsh-element-ref-strip'
+    /** Bumped on every client-side change: diagnostics report which build is running. */
+    const CLIENT_BUILD = 'c5'
+    const STRIP_SKIP = '[data-element-ref-strip],[data-element-ref-menu],[data-dsh-element-ref]'
+    /** The Agent-browser preview mirrors another page: it is chrome, not content. */
+    const DSH_SKIP = STRIP_SKIP + ",[class*='dsh-ego-side']"
+    const RECENT_KEY = 'dsh-element-ref:recent'
+    const RECENT_MAX = 8
+    const GUEST_POLL_MS = 180
 
-    /** Captured from the composer's own inputActions via an invisible slot component. */
-    const bridge = { actions: null }
-    /** Translator bound in apply; used by factories that outlive that closure. */
-    let translate = (key) => key
+    const CAP = { label: 56, desc: 48, selector: 180, page: 240, text: 80, frame: 120, url: 240 }
 
-    const ANCHOR_COLLAPSE = /收起右侧边栏|Collapse right sidebar|收起侧边栏|Collapse sidebar/
-    const ANCHOR_SPLIT = /分栏|拆分窗格|分屏|Split pane|^Split$/i
+    /**
+     * The one place that spells a reference block. `formatReference` writes it,
+     * `parseUserBlock` reads it, and the sent-message rule is generated from it —
+     * so the submitted text and its rendering cannot drift apart.
+     *
+     * The block has to answer "what is this and where is it" for a model that
+     * cannot query the page, so a DSH pick leads with a semantic region and a
+     * role/name locator instead of a positional CSS path.
+     */
+    const BLOCK = {
+      element: '[引用元素]',
+      link: '[引用链接]',
+      fields: {
+        page: '页面',
+        title: '标签页',
+        selector: '选择器',
+        alternative: '备选',
+        locator: '可定位',
+        region: '位置',
+        scale: '缩放',
+        table: '表格',
+        resource: '资源',
+        excerpt: '摘录',
+        nearby: '附近',
+        owner: '所在',
+        content: '内容',
+        index: '序号',
+        attrs: '属性',
+        component: '组件',
+        rect: '坐标',
+        text: '文本',
+        frame: '框架',
+        url: '链接',
+      },
+    }
+
+    /** Detail budget: everything is offered, then the highest-value lines are kept. */
+    const DETAIL_RANK = { compact: 0, standard: 1, full: 2 }
+    const DETAIL_BUDGET = { compact: 260, standard: 520, full: 1200 }
+    let textDetail = 'standard'
+    let textBudget = DETAIL_BUDGET.standard
+    /** `quote` uses the composer's native quote card; `chip` uses a reference chip. */
+    let referenceStyle = 'quote'
+    /** Build stamp of the kernel the Host serves, so the page replaces a stale one. */
+    let agentBuild = ''
+
+    function textConfig() {
+      return { detail: textDetail, budget: textBudget }
+    }
+
+    function setTextConfig(detail, budget) {
+      if (DETAIL_RANK[detail] !== undefined) textDetail = detail
+      const fallback = DETAIL_BUDGET[textDetail]
+      textBudget = typeof budget === 'number' && Number.isFinite(budget) && budget > 0 ? Math.round(budget) : fallback
+    }
+
+    function setReferenceStyle(style) {
+      referenceStyle = style === 'chip' ? 'chip' : 'quote'
+    }
 
     const ICON =
-      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" ' +
+      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.7" ' +
       'stroke-linecap="round" stroke-linejoin="round">' +
-      '<path d="M4 8V5.5A1.5 1.5 0 0 1 5.5 4H8"/>' +
-      '<path d="M16 4h2.5A1.5 1.5 0 0 1 20 5.5V8"/>' +
-      '<path d="M20 16v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/>' +
-      '<path d="M8 20H5.5A1.5 1.5 0 0 1 4 18.5V16"/>' +
-      '<circle cx="12" cy="12" r="2.2"/>' +
-      '</svg>'
-
-    const LINK_ICON =
-      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" ' +
-      'stroke-linecap="round" stroke-linejoin="round">' +
-      '<path d="M10.5 13.5a4.5 4.5 0 0 0 6.4 0l2.1-2.1a4.5 4.5 0 0 0-6.4-6.4l-1.1 1.1"/>' +
-      '<path d="M13.5 10.5a4.5 4.5 0 0 0-6.4 0l-2.1 2.1a4.5 4.5 0 0 0 6.4 6.4l1.1-1.1"/>' +
-      '</svg>'
-
-    const FILE_ICON =
-      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" ' +
-      'stroke-linecap="round" stroke-linejoin="round">' +
-      '<path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/>' +
-      '<path d="M14 3v5h5"/>' +
-      '</svg>'
+      '<path d="M4 9V6.5A1.5 1.5 0 0 1 5.5 5H8"/><path d="M16 5h2.5A1.5 1.5 0 0 1 20 6.5V9"/>' +
+      '<path d="M20 15v2.5a1.5 1.5 0 0 1-1.5 1.5H16"/><path d="M8 19H5.5A1.5 1.5 0 0 1 4 17.5V15"/>' +
+      '<path d="M12 8.5v7M8.5 12h7"/></svg>'
 
     const STYLES = [
-      '[data-dsh-ep-strip]{display:inline-flex;align-items:center;justify-content:center;flex:none;',
+      '[data-element-ref-strip]{display:inline-flex;align-items:center;justify-content:center;flex:none;',
       'padding:0 2px;border:0;background:transparent;color:inherit;cursor:pointer;border-radius:6px}',
-      '[data-dsh-ep-strip]:hover{background:var(--dsw-alias-bg-layer-2)}',
-      '[data-dsh-ep-strip][data-on]{color:var(--dsw-alias-brand-primary)}',
-      '[data-dsh-ep-strip]:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}',
-      '[data-dsh-ep-strip] svg{display:block;width:16px;height:16px}',
-      '.dsh-ep-box{position:fixed;z-index:2147483646;pointer-events:none;display:none;',
-      'border:1px solid var(--dsw-alias-brand-primary, #6cf);border-radius:2px;',
-      'background:rgba(90,180,255,0.14);box-shadow:0 0 0 1px rgba(0,0,0,0.45),0 0 16px rgba(90,180,255,0.35)}',
-      '.dsh-ep-tip{position:fixed;z-index:2147483647;pointer-events:none;display:none;max-width:70vw;',
-      'overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:3px 6px;border-radius:4px;',
-      'background:#0b1220;color:#dff1ff;border:1px solid rgba(120,200,255,0.5);',
-      'font:11px/1.4 ui-monospace,Menlo,Consolas,monospace}',
-      '.dsh-ep-tip[data-warn]{background:#3a1d1d;color:#ffd9d9;border-color:rgba(255,140,140,0.6)}',
-      '.dsh-ep-chip{display:inline-flex;align-items:baseline;gap:3px;max-width:240px;',
-      'color:var(--dsw-alias-state-business-primary);vertical-align:baseline;padding:0 4px;',
-      'border-radius:var(--dsw-radius-sm);cursor:pointer}',
-      '.dsh-ep-chip:hover{background:var(--dsw-alias-state-business-tertiary)}',
-      '.dsh-ep-chip-icon{display:inline-flex;flex:none;align-self:center}',
-      '.dsh-ep-chip-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
-      '.dsh-ep-flash{position:fixed;z-index:2147483646;pointer-events:none;border-radius:2px;',
-      'border:2px solid var(--dsw-alias-brand-primary, #4c8dff);background:rgba(90,180,255,0.18);',
-      'box-shadow:0 0 0 1px rgba(0,0,0,0.45),0 0 18px rgba(90,180,255,0.45);transition:opacity .3s ease}',
-      '.dsh-ep-toast{position:fixed;left:50%;bottom:32px;transform:translateX(-50%);z-index:2147483647;',
-      'padding:6px 12px;border-radius:8px;background:rgba(20,26,36,0.94);color:#e8f3ff;font-size:12px;',
-      'border:1px solid rgba(120,200,255,0.35);opacity:0;pointer-events:none;transition:opacity .18s ease}',
-      '.dsh-ep-toast[data-show]{opacity:1}',
-      '.dsh-ep-recent{position:fixed;z-index:2147483647;min-width:260px;max-width:420px;padding:6px;border-radius:8px;',
-      'background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);',
+      '[data-element-ref-strip]:hover{background:var(--dsw-alias-bg-layer-2)}',
+      '[data-element-ref-strip][data-on]{color:var(--dsw-alias-state-business-primary)}',
+      '[data-element-ref-strip]:focus-visible{outline:2px solid var(--dsw-alias-brand-primary);outline-offset:1px}',
+      '[data-element-ref-strip] svg{display:block;width:16px;height:16px}',
+      '.dsh-element-ref-toast{position:fixed;left:50%;bottom:28px;transform:translateX(-50%);z-index:2147483647;',
+      'max-width:min(560px,80vw);padding:6px 12px;border-radius:8px;background:rgba(20,26,36,.95);color:#e8f3ff;',
+      'font-size:12px;line-height:1.5;border:1px solid rgba(120,200,255,.35);opacity:0;pointer-events:none;',
+      'transition:opacity .16s ease}',
+      '.dsh-element-ref-toast[data-show]{opacity:1}',
+      '.dsh-element-ref-menu{position:fixed;z-index:2147483647;min-width:250px;max-width:360px;padding:6px;',
+      'border-radius:8px;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l2);',
       'box-shadow:0 12px 32px rgba(0,0,0,.35);font-size:12px;color:var(--dsw-alias-label-primary)}',
-      '.dsh-ep-recent-title{display:flex;justify-content:space-between;gap:8px;padding:2px 6px 6px;',
-      'color:var(--dsw-alias-label-tertiary);font-size:11px}',
-      '.dsh-ep-recent-row{display:block;width:100%;text-align:left;border:0;background:transparent;',
-      'border-radius:6px;padding:5px 8px;font:inherit;color:inherit;cursor:pointer;white-space:nowrap;',
-      'overflow:hidden;text-overflow:ellipsis}',
-      '.dsh-ep-recent-row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dsh-element-ref-menu-title{padding:2px 6px 6px;color:var(--dsw-alias-label-tertiary);font-size:11px}',
+      '.dsh-element-ref-menu-row{display:flex;gap:8px;align-items:baseline;width:100%;text-align:left;border:0;',
+      'background:transparent;border-radius:6px;padding:5px 8px;font:inherit;color:inherit;cursor:pointer;',
+      'white-space:nowrap;overflow:hidden;text-overflow:ellipsis}',
+      '.dsh-element-ref-menu-row:hover{background:var(--dsw-alias-interactive-bg-hover)}',
+      '.dsh-element-ref-menu-row[data-static]{cursor:default;color:var(--dsw-alias-label-tertiary)}',
+      '.dsh-element-ref-menu-row[data-static]:hover{background:transparent}',
+      '.dsh-element-ref-menu-dot{flex:none;width:6px;height:6px;border-radius:50%;background:var(--dsw-alias-label-tertiary);opacity:.5}',
+      '.dsh-element-ref-menu-dot[data-ok]{background:var(--dsw-alias-state-business-primary);opacity:1}',
+      // A reference block in a sent message renders as one chip: same metrics as
+      // the composer's inline reference, its own classes (never the build hashes).
+      '.dsh-element-ref-chip{display:inline-flex;align-items:baseline;gap:3px;max-width:240px;',
+      'color:var(--dsw-alias-state-business-primary);vertical-align:baseline;user-select:none}',
+      '.dsh-element-ref-chip[data-interactive]{cursor:pointer}',
+      '.dsh-element-ref-chip[data-interactive]:hover{background:var(--dsw-alias-state-business-tertiary);',
+      'border-radius:var(--dsw-radius-sm)}',
+      '.dsh-element-ref-chip-glyph{flex:none;display:inline-flex;align-items:center;font-weight:500}',
+      '.dsh-element-ref-chip-mark{font-size:13px;line-height:1;opacity:.85}',
+      '.dsh-element-ref-chip-label{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     ].join('')
 
     function installStyles() {
       const tag = document.createElement('style')
-      tag.dataset.dshElementPicker = '1'
+      tag.dataset.dshElementRef = '1'
       tag.textContent = STYLES
       document.head.appendChild(tag)
       return () => tag.remove()
     }
 
-    /* ------------------------------------------------------------------ DOM */
+    /* ---------------------------------------------------------- pure format */
 
-    function docOf(node) {
-      return (node && node.ownerDocument) || document
-    }
-
-    function classesOf(node) {
-      if (!node.classList) return []
-      return Array.from(node.classList).filter((name) => name.indexOf('dsh-ep') !== 0)
-    }
-
-    function labelOf(node) {
-      const classes = classesOf(node).slice(0, 3).join('.')
-      return node.tagName.toLowerCase() + (node.id ? '#' + node.id : '') + (classes ? '.' + classes : '')
-    }
-
-    function ownText(node) {
-      let text = ''
-      for (const child of Array.from(node.childNodes)) {
-        if (child.nodeType === 3) text += child.nodeValue
-      }
-      return text.replace(/\s+/g, ' ').trim().slice(0, 90)
-    }
-
-    function shortLabel(node) {
-      const classes = stableClasses(node)
-      const base = node.tagName.toLowerCase() + (node.id ? '#' + node.id : '') + (classes.length ? '.' + classes[0] : '')
-      const alt = node.getAttribute && node.getAttribute('alt')
-      const text = ownText(node) || (typeof alt === 'string' && alt !== '' ? alt : '') ||
-        (node.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 40)
-      return text ? base + ' · ' + text.slice(0, 32) : base
-    }
-
-    /** Chain of frame elements from the top document down to the node's document. */
-    function framesOf(node) {
-      const chain = []
-      let doc = node.ownerDocument
-      let guard = 0
-      while (doc && doc !== document && guard < 8) {
-        guard += 1
-        const view = doc.defaultView
-        const frame = view ? view.frameElement : null
-        if (!frame) break
-        chain.unshift(frame)
-        doc = frame.ownerDocument
-      }
-      return chain
-    }
-
-    function selectorFor(node) {
-      if (!node || node.nodeType !== 1) return ''
-      const doc = docOf(node)
-      if (node.id) {
-        try {
-          if (doc.querySelectorAll('#' + CSS.escape(node.id)).length === 1) return '#' + CSS.escape(node.id)
-        } catch (error) { /* fall through */ }
-      }
-      const path = []
-      let cur = node
-      while (cur && cur.nodeType === 1 && cur !== doc.documentElement) {
-        let seg = cur.tagName.toLowerCase()
-        if (cur.id) {
-          try {
-            if (doc.querySelectorAll('#' + CSS.escape(cur.id)).length === 1) {
-              path.unshift('#' + CSS.escape(cur.id))
-              break
-            }
-          } catch (error) { /* ignore */ }
-        }
-        const classes = classesOf(cur).slice(0, 2)
-        if (classes.length) seg += '.' + classes.map((name) => CSS.escape(name)).join('.')
-        const parent = cur.parentElement
-        if (parent) {
-          const same = Array.from(parent.children).filter((child) => child.tagName === cur.tagName)
-          if (same.length > 1) seg += ':nth-of-type(' + (same.indexOf(cur) + 1) + ')'
-        }
-        path.unshift(seg)
-        try {
-          if (doc.querySelectorAll(path.join(' > ')).length === 1) break
-        } catch (error) { /* keep walking */ }
-        cur = cur.parentElement
-      }
-      return path.join(' > ')
-    }
-
-    /** The node's rect translated into the top document's viewport coordinates. */
-    function topRect(node) {
-      const rect = node.getBoundingClientRect()
-      let x = rect.left
-      let y = rect.top
-      let doc = node.ownerDocument
-      let guard = 0
-      while (doc && doc !== document && guard < 8) {
-        guard += 1
-        const view = doc.defaultView
-        const frame = view ? view.frameElement : null
-        if (!frame) break
-        const frameRect = frame.getBoundingClientRect()
-        x += frameRect.left
-        y += frameRect.top
-        doc = frame.ownerDocument
-      }
-      return { x, y, width: rect.width, height: rect.height }
-    }
-
-    /** The top document plus every same-origin frame document, recursively. */
-    function reachableDocuments(root = document, out = [], depth = 0) {
-      if (out.indexOf(root) === -1) out.push(root)
-      if (depth > 6) return out
-      let frames = []
-      try {
-        frames = Array.from(root.querySelectorAll('iframe, frame'))
-      } catch (error) {
-        frames = []
-      }
-      for (const frame of frames) {
-        let inner = null
-        try {
-          inner = frame.contentDocument
-        } catch (error) {
-          inner = null
-        }
-        if (inner && inner.documentElement) reachableDocuments(inner, out, depth + 1)
-      }
-      return out
-    }
-
-    /** CSS-module / hashed class names change on every build; never anchor on them. */
-    function isHashedName(name) {
-      return /^[A-Za-z0-9]{4,8}_/.test(name) || name.indexOf('__') !== -1
-    }
-
-    function stableClasses(node) {
-      return classesOf(node).filter((name) => !isHashedName(name)).slice(0, 2)
-    }
-
-    /** One path segment: id, else a stable attribute, else stable classes, else tag. */
-    function segmentFor(node, withIndex) {
-      if (!node || node.nodeType !== 1) return ''
-      const doc = docOf(node)
-      if (node.id) {
-        try {
-          if (doc.querySelectorAll('#' + CSS.escape(node.id)).length === 1) return '#' + CSS.escape(node.id)
-        } catch (error) { /* ignore */ }
-      }
-      let seg = node.tagName.toLowerCase()
-      for (const attr of ['data-testid', 'data-id', 'data-name', 'data-path', 'name']) {
-        const value = node.getAttribute(attr)
-        if (typeof value === 'string' && value !== '' && value.length <= 48) {
-          return seg + '[' + attr + '="' + value.replace(/"/g, '\\"') + '"]'
-        }
-      }
-      const classes = stableClasses(node)
-      if (classes.length > 0) seg += '.' + classes.map((name) => CSS.escape(name)).join('.')
-      if (withIndex) {
-        const parent = node.parentElement
-        if (parent) {
-          const same = Array.from(parent.children).filter((child) => child.tagName === node.tagName)
-          if (same.length > 1) seg += ':nth-of-type(' + (same.indexOf(node) + 1) + ')'
-        }
-      }
-      return seg
-    }
-
-    /**
-     * Ordered locators for one element: the shortest unique suffix built from stable
-     * segments first, then a full structural path (unique while the layout holds).
-     * Returns `{ primary, fallbacks }`; a click tries them in order.
-     */
-    function selectorsFor(node) {
-      const doc = docOf(node)
-      const list = []
-      const push = (selector) => {
-        if (typeof selector !== 'string' || selector === '' || list.indexOf(selector) !== -1) return
-        try {
-          if (doc.querySelectorAll(selector).length === 1) list.push(selector)
-        } catch (error) { /* invalid selector: skip */ }
-      }
-
-      if (node.id) push('#' + CSS.escape(node.id))
-
-      const suffix = []
-      let cur = node
-      while (cur && cur.nodeType === 1 && cur !== doc.documentElement) {
-        suffix.unshift(segmentFor(cur, false))
-        push(suffix.join(' > '))
-        cur = cur.parentElement
-      }
-
-      const structural = []
-      cur = node
-      while (cur && cur.nodeType === 1) {
-        structural.unshift(segmentFor(cur, true))
-        push(structural.join(' > '))
-        if (cur === doc.documentElement) break
-        cur = cur.parentElement
-      }
-
-      const primary = list.length > 0 ? list[0] : selectorFor(node)
-      return { primary, fallbacks: list.filter((item) => item !== primary) }
-    }
-
-    /** What an element points at: an image source, a link target, a file path. */
-    function resourceOf(node) {
-      const tag = node.tagName
-      const raw =
-        tag === 'IMG' || tag === 'VIDEO' || tag === 'SOURCE' || tag === 'AUDIO'
-          ? node.getAttribute('src') || node.getAttribute('poster') || ''
-          : tag === 'A' || tag === 'AREA'
-            ? node.getAttribute('href') || ''
-            : node.getAttribute('src') || ''
-      if (typeof raw !== 'string' || raw === '' || raw.startsWith('javascript:') || raw.startsWith('#')) return ''
-      try {
-        return new URL(raw, docOf(node).baseURI || location.href).href.slice(0, 200)
-      } catch (error) {
-        return raw.slice(0, 200)
-      }
-    }
-
-    function visibleComposer() {
-      const nodes = Array.from(document.querySelectorAll('textarea, [contenteditable="true"], [role="textbox"]'))
-      const candidates = nodes.filter((node) => {
-        const rect = node.getBoundingClientRect()
-        return rect.width > 80 && rect.height > 12 && rect.bottom > 0 && rect.top < window.innerHeight + 240
-      })
-      candidates.sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)
-      return candidates[0] || null
-    }
-
-    function insertIntoComposer(text) {
-      const target = visibleComposer()
-      if (target === null) return false
-      target.focus()
-
-      if (target.tagName === 'TEXTAREA' || target.tagName === 'INPUT') {
-        const proto = target.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype
-        const setter = Object.getOwnPropertyDescriptor(proto, 'value').set
-        const next = target.value ? target.value.replace(/\s*$/, '') + '\n\n' + text : text
-        setter.call(target, next)
-        target.dispatchEvent(new Event('input', { bubbles: true }))
-        target.setSelectionRange(next.length, next.length)
-        return true
-      }
-
-      try {
-        const selection = target.ownerDocument.getSelection()
-        const range = document.createRange()
-        range.selectNodeContents(target)
-        range.collapse(false)
-        selection.removeAllRanges()
-        selection.addRange(range)
-      } catch (error) { /* caret placement is best effort */ }
-
-      const before = target.textContent || ''
-      const payload = (before.trim() === '' ? '' : '\n\n') + text
-      let inserted = false
-      try {
-        inserted = document.execCommand('insertText', false, payload)
-      } catch (error) {
-        inserted = false
-      }
-      if (!inserted) target.textContent = before + payload
-      target.dispatchEvent(new Event('input', { bubbles: true }))
-      return true
-    }
-
-    /* --------------------------------------------------------------- kinds */
-
-    const KINDS = {
-      element: { prefix: '[引用元素]', source: 'element-picker', glyph: () => ICON },
-      url: { prefix: '[引用网址]', source: 'element-picker:url', glyph: () => LINK_ICON },
-      file: { prefix: '[引用文件]', source: 'element-picker:file', glyph: () => FILE_ICON },
-    }
-
-    function kindOf(value) {
-      return KINDS[value] === undefined ? 'element' : value
-    }
-
-    const DESKTOP_ICON =
-      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" ' +
-      'stroke-linecap="round" stroke-linejoin="round">' +
-      '<rect x="3" y="4" width="18" height="12" rx="1.5"/><path d="M8 20h8M12 16v4"/></svg>'
-
-    const WEB_ICON =
-      '<svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" ' +
-      'stroke-linecap="round" stroke-linejoin="round">' +
-      '<circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.4 2.4 3.6 5.4 3.6 8.5s-1.2 6.1-3.6 8.5c-2.4-2.4-3.6-5.4-3.6-8.5S9.6 5.9 12 3.5z"/></svg>'
-
-    /** Chips carry where they came from: desktop control, browser DOM, or a file. */
-    function glyphFor(kind, source) {
-      if (kindOf(kind) === 'element') {
-        if (source === 'browser-cdp') {
-          return WEB_ICON.replace('width="16" height="16"', 'width="14" height="14"')
-        }
-        if (source === 'uia') {
-          return DESKTOP_ICON.replace('width="16" height="16"', 'width="14" height="14"')
-        }
-      }
-      return KINDS[kindOf(kind)].glyph().replace('width="16" height="16"', 'width="14" height="14"')
+    function clip(value, max) {
+      const text = String(value === undefined || value === null ? '' : value).replace(/\s+/g, ' ').trim()
+      return text.length > max ? text.slice(0, max) : text
     }
 
     function parsePayload(ref) {
       try {
         const parsed = JSON.parse(String(ref))
-        return parsed && typeof parsed === 'object' ? parsed : null
+        return parsed !== null && typeof parsed === 'object' ? parsed : null
       } catch (error) {
         return null
       }
     }
 
-    /** One payload → the block the model reads, without the trailing newline. */
-    function fieldsOf(payload) {
-      const kind = kindOf(payload.kind)
-      const lines = [KINDS[kind].prefix + ' ' + (payload.label || '')]
-      if (kind === 'element') {
-        if (payload.selector) lines.push('选择器: ' + payload.selector)
-        if (payload.os) {
-          // An element outside DSH: describe the window and the control instead of
-          // a CSS selector, which does not exist there.
-          if (payload.os.window) lines.push('窗口: ' + payload.os.window)
-          const control = [payload.os.controlType, payload.os.name].filter(Boolean).join(' · ')
-          if (control) lines.push('控件: ' + control)
-          const locator = [payload.os.automationId ? 'AutomationId=' + payload.os.automationId : '', payload.os.className ? 'Class=' + payload.os.className : '']
-            .filter(Boolean)
-            .join(' ')
-          if (locator) lines.push('定位: ' + locator)
-          if (payload.os.bounds) {
-            const box = payload.os.bounds
-            lines.push('位置: ' + [box.x, box.y].join(',') + ' ' + [box.w, box.h].join('×'))
-          }
-        }
-        if (payload.context) lines.push('位置: ' + payload.context)
-        if (payload.content) lines.push('内容定位: ' + payload.content)
-        if (payload.textRange) lines.push('文本区间: ' + payload.textRange)
-        if (payload.resource) lines.push('资源: ' + payload.resource)
-        if (payload.page && !payload.os) lines.push('页面: ' + payload.page)
-        if (payload.frame) lines.push('框架: ' + payload.frame)
-        if (payload.text) lines.push('文本: ' + payload.text)
-      } else if (kind === 'url') {
-        if (payload.url) lines.push('链接: ' + payload.url)
-      } else if (kind === 'file') {
-        if (payload.path) lines.push('路径: ' + payload.path)
-      }
-      return lines.join('\n')
+    function kindOf(payload) {
+      return payload && payload.kind === 'link' ? 'link' : 'element'
     }
 
-    /** Submit-time model form; the trailing newline keeps later typing out of the block. */
-    function decodeRef(ref) {
-      const payload = parsePayload(ref)
-      if (payload === null) return '[引用元素] ' + String(ref)
-      return fieldsOf(payload) + '\n'
+    /** Composer chip text: short, no newlines. */
+    function chipLabel(payload) {
+      if (!payload) return '引用'
+      if (kindOf(payload) === 'link') return clip(payload.label || payload.url, CAP.label)
+      return clip(payload.label || payload.desc || '元素', CAP.label)
     }
 
-    /** Nearest ancestor carrying an href/src, resolved against its document base. */
-    function urlOf(node) {
-      let current = node
-      for (let depth = 0; current && current.nodeType === 1 && depth < 4; depth += 1) {
-        const raw = current.getAttribute('href') || current.getAttribute('data-url') || current.getAttribute('src')
-        if (typeof raw === 'string' && raw !== '' && !raw.startsWith('#') && !raw.startsWith('javascript:')) {
-          try {
-            const url = new URL(raw, docOf(current).baseURI || location.href).href
-            const text = ownText(current) || current.getAttribute('title') || url
-            return { url, label: text.slice(0, 60) }
-          } catch (error) { /* not a URL */ }
-        }
-        current = current.parentElement
-      }
-      return null
-    }
-
-    /** Nearest ancestor carrying a filesystem path, then the owning component's props. */
-    function pathOf(node) {
-      let current = node
-      for (let depth = 0; current && current.nodeType === 1 && depth < 4; depth += 1) {
-        const raw =
-          current.getAttribute('data-path') ||
-          current.getAttribute('data-file') ||
-          current.getAttribute('data-src') ||
-          current.getAttribute('title')
-        const href = current.getAttribute('href') || ''
-        const path =
-          typeof raw === 'string' && /^(?:[A-Za-z]:[\\/]|\/|\.{1,2}\/|~\/)/.test(raw.trim())
-            ? raw.trim()
-            : href.startsWith('file://')
-              ? decodeURIComponent(href.slice(7))
-              : ''
-        if (path !== '') {
-          const parts = path.split(/[\\/]/u).filter(Boolean)
-          return { path, label: parts.length > 0 ? parts[parts.length - 1] : path }
-        }
-        current = current.parentElement
-      }
-      // File lists rarely put the path in the DOM; the row component's props have it.
-      const fromFiber = pathFromFiber(node)
-      if (fromFiber !== null) {
-        const parts = fromFiber.split(/[\\/]/u).filter(Boolean)
-        return { path: fromFiber, label: parts.length > 0 ? parts[parts.length - 1] : fromFiber }
-      }
-      return null
-    }
-
-    /** React fiber for one DOM node, if the node was rendered by React. */
-    function fiberOf(node) {
-      if (node === null || node.nodeType !== 1) return null
-      const key = Object.keys(node).find(
-        (name) => name.indexOf('__reactFiber$') === 0 || name.indexOf('__reactInternalInstance$') === 0,
-      )
-      return key === undefined ? null : node[key]
+    /** Clipboard/persistence projection of a chip: one short line. */
+    function clipboardOf(payload) {
+      if (!payload) return ''
+      return (kindOf(payload) === 'link' ? BLOCK.link : BLOCK.element) + ' ' + chipLabel(payload)
     }
 
     /**
-     * Walk the owning component's props for a filesystem path. File-tree rows hand
-     * their path down as a prop (`path` / `entry.path`), and the nearest ancestor
-     * carrying one is the row under the pointer.
+     * What the model reads. Field order is information density; empty and
+     * redundant fields are dropped, and every value has a hard cap.
+     *
+     * This is the ONLY writer of a reference block, and `parseUserBlock` below is
+     * its reader: both use `BLOCK`, so the sent-message renderer cannot drift
+     * away from the submitted text.
+     * @param {object} payload
+     * @returns {string} the reference block, newline-terminated
      */
-    function pathFromFiber(node) {
-      const looksLikePath = (value) => typeof value === 'string' && value !== '' && /[\\/]/.test(value)
-      let fiber = fiberOf(node)
-      for (let depth = 0; fiber && depth < 14; depth += 1) {
-        const props = fiber.memoizedProps
-        if (props && typeof props === 'object') {
-          for (const key of ['path', 'filePath', 'absPath', 'fullPath']) {
-            const value = props[key]
-            if (looksLikePath(value)) return value
-          }
-          const entry = props.entry || props.item || props.row
-          if (entry && typeof entry === 'object' && !entry.$$typeof) {
-            for (const key of ['path', 'filePath', 'absPath', 'fullPath']) {
-              const value = entry[key]
-              if (looksLikePath(value)) return value
-            }
-          }
-        }
-        fiber = fiber.return
-      }
-      return null
-    }
-
-    /** The `@path` mention form the reference plugin understands (quoted when needed). */
-    function mentionOf(path) {
-      return /\s/.test(path) ? '@"' + path + '"' : '@' + path
-    }
-
-    function basenameOf(path) {
-      const parts = String(path).split(/[\\/]/u).filter(Boolean)
-      return parts.length > 0 ? parts[parts.length - 1] : String(path)
-    }
-
-    /** Payload for one pick; a kind with nothing to carry falls back to the element. */
-    /* --------------------------------------------------------- choosing */
-
-    /** Elements a user actually means when they point at text inside them. */
-    const MEANINGFUL_TAGS = /^(BUTTON|A|INPUT|TEXTAREA|SELECT|LABEL|TR|LI|IMG|H[1-6]|SUMMARY|DETAILS)$/
-
-    function isMeaningful(node) {
-      if (node === null || node.nodeType !== 1) return false
-      if (MEANINGFUL_TAGS.test(node.tagName)) return true
-      if (node.hasAttribute('role')) return true
-      if (node.hasAttribute('aria-label') || node.hasAttribute('data-testid') || node.hasAttribute('name')) return true
-      if (node.isContentEditable) return true
-      return false
-    }
-
-    /** Climb until the node is something a user would name ("the button", "the row"). */
-    function meaningfulAncestor(node) {
-      let element = node
-      for (let depth = 0; depth < 6 && element !== null && element.parentElement !== null; depth += 1) {
-        if (isMeaningful(element)) return element
-        element = element.parentElement
-      }
-      return node
-    }
-
-    function climb(node, levels) {
-      let element = node
-      for (let step = 0; step < levels && element !== null && element.parentElement !== null; step += 1) {
-        element = element.parentElement
-      }
-      return element
-    }
-
-    function clip(text, length) {
-      return String(text || '').replace(/\s+/g, ' ').trim().slice(0, length)
-    }
-
-    /** "设置 > 音频 > 输出设备" from ancestor labels and headings. */
-    function contextOf(node) {
-      const parts = []
-      let element = node
-      for (let depth = 0; depth < 5 && element !== null && element !== document.body; depth += 1) {
-        const parent = element.parentElement
-        if (parent === null) break
-        const label = parent.getAttribute('aria-label') || parent.getAttribute('data-testid') || ''
-        if (label !== '') {
-          parts.unshift(clip(label, 24))
-        } else {
-          let heading = null
-          for (const child of Array.from(parent.children)) {
-            if (/^H[1-6]$/.test(child.tagName)) {
-              heading = child
-              break
-            }
-          }
-          if (heading !== null) parts.unshift(clip(heading.textContent, 24))
-        }
-        element = parent
-        if (parts.length >= 3) break
-      }
-      return parts.filter(Boolean).join(' > ')
-    }
-
-    /** A re-findable locator that survives a rebuild: role + visible text. */
-    function contentLocator(node) {
-      const role = node.getAttribute('role') || node.tagName.toLowerCase()
-      const name =
-        node.getAttribute('aria-label') ||
-        ownText(node) ||
-        node.getAttribute('title') ||
-        node.getAttribute('alt') ||
-        ''
-      const text = clip(name, 40)
-      return text === '' ? '' : role + ' >> text=' + text
-    }
-
-    /** The selected text range inside the node, when the user selected some. */
-    function textRangeOf(node) {
-      try {
-        const selection = window.getSelection()
-        if (selection === null || selection.rangeCount === 0) return null
-        const range = selection.getRangeAt(0)
-        if (!node.contains(range.commonAncestorContainer)) return null
-        const text = clip(String(range), 120)
-        return text === '' ? null : text
-      } catch (error) {
-        return null
-      }
-    }
-
-    function buildPayload(kind, node, page) {
-      if (kind === 'url') {
-        const found = urlOf(node)
-        if (found !== null) return { kind: 'url', label: found.label, url: found.url }
-      }
-      if (kind === 'file') {
-        const found = pathOf(node)
-        if (found !== null) return { kind: 'file', label: found.label, path: found.path }
-      }
-      const chain = framesOf(node)
-      const info = selectorsFor(node)
-      const prefix = (selector) =>
-        chain.length === 0
-          ? selector
-          : chain.map((frame) => selectorFor(frame)).join(FRAME_SEP) + FRAME_SEP + selector
-      const fallbacks = info.fallbacks.map(prefix).filter((item) => item !== prefix(info.primary))
-      const top = chain.length === 0 ? null : chain[chain.length - 1]
-      return {
-        kind: 'element',
-        label: shortLabel(node),
-        selector: prefix(info.primary),
-        fallbacks,
-        resource: resourceOf(node),
-        page: page || location.href,
-        frame: top === null ? '' : top.getAttribute('src') || top.getAttribute('data-src') || '',
-        text: ownText(node),
-        context: contextOf(node),
-        content: contentLocator(node),
-        textRange: textRangeOf(node),
-      }
-    }
-
-    /* -------------------------------------------------------------- editor */
-
-    /** Find the composer's Lexical editor through the composer DOM's React fiber. */
-    function findEditor() {
-      const root = document.querySelector('[contenteditable="true"]')
-      if (root === null) return null
-      const key = Object.keys(root).find(
-        (name) => name.indexOf('__reactFiber$') === 0 || name.indexOf('__reactInternalInstance$') === 0,
-      )
-      if (key === undefined) return null
-      let fiber = root[key]
-      for (let depth = 0; fiber && depth < 90; depth += 1) {
-        const props = fiber.memoizedProps
-        if (props && typeof props === 'object') {
-          const value = props.value
-          if (value && typeof value === 'object' && typeof value.update === 'function' && value._nodes) return value
-          if (props.editor && typeof props.editor.update === 'function' && props.editor._nodes) return props.editor
-        }
-        fiber = fiber.return
-      }
-      return null
-    }
-
-    /** The composer's own `reference-chip` node class from the editor's node map. */
-    function chipClassOf(editor) {
-      const nodes = editor._nodes
-      const entry = nodes instanceof Map ? nodes.get('reference-chip') : nodes['reference-chip']
-      const klass = entry && (entry.klass || entry)
-      return klass && typeof klass.importJSON === 'function' ? klass : null
-    }
-
-    /** Insert a real composer chip at the draft selection. */
-    function commitChip(payload) {
-      const editor = findEditor()
-      if (editor === null) return false
-      try {
-        patchChipDecorate()
-      } catch (error) { /* chips still work through the shipped renderer */ }
-      const Chip = chipClassOf(editor)
-      if (Chip === null) return false
-      const kind = kindOf(payload.kind)
-      const refData = { ...payload, kind }
-      delete refData.clipboard
-      /**
-       * Files go through DSH's own reference source: `ui-reference` registers
-       * `source: 'reference'` whose ref IS the `@path` mention, whose codec returns
-       * that mention to the model, and whose click opens the file preview. Taking
-       * that path means the chip is the shipped one, not a look-alike.
-       */
-      const officialFile = kind === 'file' && typeof payload.path === 'string' && payload.path !== ''
-      const mention = officialFile ? mentionOf(payload.path) : ''
-      try {
-        const root = document.querySelector('[contenteditable="true"]')
-        if (root !== null && typeof root.focus === 'function') root.focus()
-        editor.update(() => {
-          const node = Chip.importJSON(
-            officialFile
-              ? {
-                  type: 'reference-chip',
-                  version: 1,
-                  source: 'reference',
-                  ref: mention,
-                  label: mention ? basenameOf(payload.path) : payload.label || '',
-                  appearance: 'file',
-                  clipboardText: mention,
-                  invalid: false,
-                }
-              : {
-                  type: 'reference-chip',
-                  version: 1,
-                  source: KINDS[kind].source,
-                  ref: JSON.stringify(refData),
-                  label: payload.label || '',
-                  appearance: kind === 'file' ? 'file' : undefined,
-                  clipboardText: payload.clipboard || fieldsOf({ ...payload, kind }),
-                  invalid: false,
-                },
-          )
-          const state = editor.getEditorState()
-          const selection = state ? state._selection : null
-          if (selection === null || typeof selection.insertNodes !== 'function') {
-            throw new Error('no composer selection')
-          }
-          // The shipped insert path appends a space after the chip and leaves the
-          // caret past it; a chip butted against the caret is awkward to delete.
-          const nodes = editor._nodes
-          const textEntry = nodes instanceof Map ? nodes.get('text') : nodes ? nodes.text : null
-          const Text = textEntry && textEntry.klass
-          let space = null
-          try {
-            space = Text ? new Text(' ') : null
-          } catch (error) {
-            space = null
-          }
-          if (space !== null) {
-            selection.insertNodes([node, space])
-            try {
-              space.select(1, 1)
-            } catch (error) { /* caret placement is optional */ }
-          } else {
-            selection.insertNodes([node])
-            try {
-              if (typeof node.selectNext === 'function') node.selectNext(0, 0)
-            } catch (error) { /* caret placement is optional */ }
-          }
-        })
-        pushRecent(payload)
-        return true
-      } catch (error) {
-        return false
-      }
-    }
-
     /**
-     * Plain-text insertion for when no chip can be made: prefer the composer's own
-     * inputActions (paste rules, undoable), fall back to a DOM edit.
+     * Compose the model-facing block inside a character budget.
+     *
+     * Every field is offered, gated by the detail level, then taken in
+     * information order until the budget is spent — so a rich element spends on
+     * what a model can act on, and a huge one degrades by dropping the least
+     * useful lines instead of overflowing the prompt.
      */
-    function commitReference(text) {
-      const actions = bridge.actions
-      if (actions !== null && typeof actions.captureInsertion === 'function' && typeof actions.insertText === 'function') {
-        try {
-          const span = actions.captureInsertion()
-          if (actions.insertText(text, span) === true) return true
-        } catch (error) { /* fall through to the DOM path */ }
+    function formatReference(payload, forceMarker) {
+      if (!payload) return ''
+      const F = BLOCK.fields
+      const rank = DETAIL_RANK[textDetail]
+      const lines = []
+      const marker = referenceStyle === 'quote' && forceMarker !== true ? '' : BLOCK.element + ' '
+      if (kindOf(payload) === 'link') {
+        // Same marker rule as elements: the quote card already shows a quote mark.
+        const linkMarker = referenceStyle === 'quote' && forceMarker !== true ? '' : BLOCK.link + ' '
+        lines.push(linkMarker + clip(payload.label || payload.url || '', CAP.label))
+        if (payload.url) lines.push(F.url + ': ' + clip(payload.url, CAP.url))
+        if (payload.page && payload.page !== payload.url) lines.push(F.page + ': ' + clip(payload.page, CAP.page))
+        if (payload.region) lines.push(F.region + ': ' + clip(payload.region, 90))
+        if (payload.frame) lines.push(F.frame + ': ' + clip(payload.frame, CAP.frame))
+        return lines.join('\n') + '\n'
       }
-      return insertIntoComposer(text)
-    }
+      const label = clip(payload.label || payload.desc || '元素', CAP.label)
+      const role = clip(payload.role || '', 18)
+      const state = clip(payload.state || '', 56)
+      const qualify = [role, state].filter((part) => part !== '').join(', ')
+      const head = marker + (qualify !== '' ? label + ' (' + qualify + ')' : label)
+      const isWeb = payload.page !== undefined && payload.page !== '' && payload.source !== 'dsh'
 
-    /* ---------------------------------------------------------------- chip */
-
-    let chipPatch = null
-    let nativeChipClasses = null
-
-    /**
-     * The shipped chip's CSS-module class names are build hashes; read them out of
-     * the injected stylesheets so our chip looks exactly like a native one, and
-     * fall back to our own classes if a future build renames the tags.
-     */
-    function chipClassNames() {
-      if (nativeChipClasses !== null) return nativeChipClasses
-      const readCss = (tagId) => {
-        const tag = document.querySelector('style[data-plugin-css=' + JSON.stringify(tagId) + ']')
-        return tag === null ? '' : tag.textContent || ''
-      }
-      const pick = (css, suffix) => {
-        const match = new RegExp('\\.([A-Za-z0-9_-]+)_' + suffix + '\\s*\\{').exec(css)
-        return match === null ? '' : match[1] + '_' + suffix
-      }
-      const chipCss = readCss('@deepseek-ai/dsh-client-ui-conversation/ReferenceChip.module.css')
-      nativeChipClasses = {
-        reference: pick(readCss('@deepseek-ai/dsh-client-ui-conversation/composer-editor.module.css'), 'reference'),
-        chip: pick(chipCss, 'chip'),
-        icon: pick(chipCss, 'icon'),
-        label: pick(chipCss, 'label'),
-      }
-      return nativeChipClasses
-    }
-
-    /**
-     * The chip's glyph comes from a fixed appearance vocabulary with no entry for
-     * our kinds, so take the node over for our own sources — our chip body, our
-     * per-kind glyph — and let every other source fall through untouched.
-     */
-    function patchChipDecorate() {
-      if (chipPatch !== null) return true
-      const editor = findEditor()
-      if (editor === null) return false
-      const Chip = chipClassOf(editor)
-      if (Chip === null) return false
-      const original = Chip.prototype.decorate
-      if (typeof original !== 'function') return false
-      Chip.prototype.decorate = function patchedDecorate() {
-        try {
-          const source = this.__source
-          if (typeof source === 'string' && source.indexOf('element-picker') === 0) {
-            const payload = parsePayload(this.__ref)
-            const kind = kindOf(payload === null ? 'element' : payload.kind)
-            const names = chipClassNames()
-            const native = names.reference !== '' && names.chip !== ''
-            return React.createElement(
-              'span',
-              {
-                className: native ? names.reference + ' ' + names.chip : 'dsh-ep-chip',
-                'data-kind': kind,
-                title: this.__label || '',
-              },
-              React.createElement('span', {
-                className: native ? names.icon : 'dsh-ep-chip-icon',
-                dangerouslySetInnerHTML: { __html: glyphFor(kind) },
-              }),
-              React.createElement('span', { className: native ? names.label : 'dsh-ep-chip-label' }, this.__label || ''),
-            )
-          }
-        } catch (error) { /* fall through to the shipped chip */ }
-        return original.call(this)
-      }
-      chipPatch = { Chip, original }
-      return true
-    }
-
-    function unpatchChipDecorate() {
-      if (chipPatch === null) return
-      try {
-        chipPatch.Chip.prototype.decorate = chipPatch.original
-      } catch (error) { /* class already replaced */ }
-      chipPatch = null
-    }
-
-    /* -------------------------------------------------------------- locate */
-
-    function flashBox(rect) {
-      const node = document.createElement('div')
-      node.className = 'dsh-ep-flash'
-      node.style.left = rect.x + 'px'
-      node.style.top = rect.y + 'px'
-      node.style.width = rect.width + 'px'
-      node.style.height = rect.height + 'px'
-      document.body.appendChild(node)
-      setTimeout(() => {
-        node.style.opacity = '0'
-      }, 900)
-      setTimeout(() => {
-        if (node.parentNode) node.parentNode.removeChild(node)
-      }, 1300)
-    }
-
-    function flashInDocument(doc, selector) {
-      let node = null
-      try {
-        node = doc.querySelector(selector)
-      } catch (error) {
-        return false
-      }
-      if (node === null) return false
-      try {
-        node.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' })
-      } catch (error) {
-        try {
-          node.scrollIntoView()
-        } catch (inner) { /* detached */ }
-      }
-      flashBox(topRect(node))
-      return true
-    }
-
-    const WEBVIEW_FLASH =
-      '(function (sel) { try { var el = document.querySelector(sel); if (!el) return "miss"; ' +
-      'el.scrollIntoView({ block: "center", inline: "nearest" }); var r = el.getBoundingClientRect(); ' +
-      'var d = document.createElement("div"); d.style.cssText = "position:fixed;z-index:2147483647;pointer-events:none;' +
-      'border:2px solid #4c8dff;background:rgba(90,180,255,0.18);border-radius:2px;left:" + r.left + "px;top:" + r.top + ' +
-      '"px;width:" + r.width + "px;height:" + r.height + "px;transition:opacity .3s ease"; ' +
-      'document.documentElement.appendChild(d); setTimeout(function () { d.style.opacity = "0"; }, 900); ' +
-      'setTimeout(function () { d.remove(); }, 1300); return "ok"; } catch (e) { return "err"; } })'
-
-    /** Clicking a reference points back at what it names. */
-    /** `iframe-selector >>> inner-selector` — walk down frames, then flash inside. */
-    function flashCandidate(selector) {
-      const parts = selector.split(FRAME_SEP).map((part) => part.trim()).filter(Boolean)
-      if (parts.length === 0) return false
-      let doc = document
-      for (let step = 0; step < parts.length - 1; step += 1) {
-        let frame = null
-        try {
-          frame = doc.querySelector(parts[step])
-        } catch (error) {
-          frame = null
-        }
-        if (frame === null || frame.contentDocument == null) return false
-        doc = frame.contentDocument
-      }
-      return flashInDocument(doc, parts[parts.length - 1])
-    }
-
-    /** Clicking a reference points back at what it names, trying every locator. */
-    function flashReference(payload) {
-      if (payload === null || typeof payload !== 'object') return false
+      /** @type {{ order: number, text: string, minRank: number }[]} */
       const candidates = []
-      if (typeof payload.selector === 'string' && payload.selector !== '') candidates.push(payload.selector)
-      if (Array.isArray(payload.fallbacks)) {
-        for (const item of payload.fallbacks) {
-          if (typeof item === 'string' && item !== '' && candidates.indexOf(item) === -1) candidates.push(item)
-        }
+      const offer = (field, value, order, minRank = 0) => {
+        if (value === undefined || value === '') return
+        candidates.push({ order, minRank, text: F[field] + ': ' + value })
       }
-      for (const candidate of candidates) {
-        if (flashCandidate(candidate)) return true
+
+      // A frame path is correctness, not decoration: it survives every level.
+      offer('frame', payload.frame
+        ? clip(payload.frameUrl ? payload.frame + ' → ' + payload.frameUrl : payload.frame, CAP.frame)
+        : '', 5)
+      if (isWeb) {
+        offer('page', clip(payload.page, CAP.page), 10)
+        offer('title', clip(payload.title, 80), 20, 1)
       }
-      // Same-origin lookup failed: the element may live inside a sidebar webview.
-      const leaf = candidates.length > 0 ? candidates[0].split(FRAME_SEP).pop().trim() : ''
-      if (leaf === '') return false
-      const views = Array.from(document.querySelectorAll('webview')).filter(
-        (node) => typeof node.executeJavaScript === 'function',
-      )
-      for (const view of views) {
-        try {
-          if (payload.page && typeof view.getURL === 'function') {
-            const current = view.getURL() || ''
-            if (current !== '' && current !== payload.page) continue
-          }
-          const result = view.executeJavaScript(WEBVIEW_FLASH + '(' + JSON.stringify(leaf) + ')')
-          if (result && typeof result.catch === 'function') result.catch(() => {})
-        } catch (error) { /* guest not ready */ }
+      // Where it is and where it sits on screen are one thought for a reader: one line.
+      // The box is in device pixels of the visible area (same units as a screenshot),
+      // so zoom and page scaling do not make it a lie.
+      const box = Array.isArray(payload.box) && payload.box.length === 4
+        ? payload.box[0] + ',' + payload.box[1] + ' · ' + payload.box[2] + 'x' + payload.box[3]
+        : ''
+      const viewport = Array.isArray(payload.viewport) && payload.viewport.length === 2 &&
+        payload.viewport[0] > 0 && payload.viewport[1] > 0
+        ? '视口 ' + payload.viewport[0] + 'x' + payload.viewport[1]
+        : ''
+      const picture = box === '' ? '' : '画面 ' + box
+      offer('region', [clip(payload.region, 90), picture, viewport].filter((part) => part !== '').join(' · '), 30)
+      if (typeof payload.scale === 'number' && payload.scale > 0) offer('scale', 'x' + payload.scale, 125, 2)
+      offer('table', clip(payload.table, 140), 40, 1)
+      // The media the element points at: the only way to tell what a picture is.
+      offer('owner', clip(payload.owner || '', 56), 35, 1)
+      offer('resource', clip(payload.resource || '', 140), 45)
+      if (!isWeb) offer('locator', clip(payload.locator, 90), 50)
+      if (isWeb && payload.selector) {
+        offer('selector', clip(payload.selector, CAP.selector), 50)
+        // Two selectors in one block is a luxury: the model tries one and stops.
+        if (payload.selectorAlt) offer('alternative', clip(payload.selectorAlt, CAP.selectorAlt), 60, 2)
       }
-      return false
+
+      const content = clip(payload.content || '', 90)
+      const excerptCap = rank === 0 ? 160 : rank === 1 ? 300 : 400
+      const excerpt = clip(payload.excerpt || '', excerptCap)
+      // Child labels and the text excerpt often say the same thing; print it once.
+      const redundant = content !== '' && excerpt !== '' && excerpt.indexOf(content) === 0
+      // No human name means the content IS the identity: it must never be dropped for
+      // budget, so it moves to the top level.
+      const weakName = payload.labelKind === 'selector'
+      if (content !== '' && !redundant) offer('content', content, 85, weakName ? 0 : 1)
+      // An excerpt is for "read this to me": only when it says more than the label already did.
+      if (excerpt !== '' && excerpt !== label && excerpt.length > 40 &&
+        (content === '' || redundant || excerpt.length > content.length + 20)) {
+        offer('excerpt', excerpt, 70, weakName ? 0 : 0)
+      }
+      offer('nearby', clip(payload.nearby, 80), 80, 1)
+      const text = clip(payload.text || '', CAP.text)
+      // `text` was printed here; it is almost always the label or the excerpt again,
+      // so the excerpt owns the "read this" job and this line is gone.
+      offer('index', clip(payload.index || '', 16), 100, 1)
+      offer('attrs', clip(payload.attrs || '', 140), 110, 2)
+      offer('component', clip(payload.component || '', 40), 120, 2)
+
+      const kept = []
+      let used = head.length
+      for (const candidate of candidates.sort((left, right) => left.order - right.order)) {
+        if (candidate.minRank > rank) continue
+        if (used + candidate.text.length + 1 > textBudget) continue
+        kept.push(candidate)
+        used += candidate.text.length + 1
+      }
+      return [head, ...kept.map((candidate) => candidate.text)].join('\n') + '\n'
     }
 
-    /* ------------------------------------------------------------- actions */
-
-    let toastNode = null
-    let toastTimer = 0
-
-    function toast(message, holdMs = 1600) {
-      if (toastNode === null || toastNode.parentNode === null) {
-        toastNode = document.createElement('div')
-        toastNode.className = 'dsh-ep-toast'
-        document.body.appendChild(toastNode)
+    /** The inverse of `formatReference`: one block back into display data. */
+    function parseUserBlock(raw) {
+      const text = String(raw || '')
+      const lines = text.split('\n')
+      const head = lines[0] || ''
+      // Quote mode drops the textual marker, so the kind is decided by the fields when
+      // the header is bare: only a link block carries a `链接:` line.
+      const bareLink = !head.startsWith(BLOCK.element) && !head.startsWith(BLOCK.link) &&
+        lines.some((line) => line.startsWith(BLOCK.fields.url + ':'))
+      const kind = head.startsWith(BLOCK.link) || bareLink ? 'link' : 'element'
+      const stripped = head.startsWith(BLOCK.element)
+        ? head.slice(BLOCK.element.length)
+        : head.startsWith(BLOCK.link) ? head.slice(BLOCK.link.length) : head
+      const body = stripped.trim()
+      const data = {
+        kind,
+        label: stripDesc(body),
+        desc: '',
+        selector: '',
+        page: '',
+        context: '',
+        text: '',
+        frame: '',
+        url: '',
+        raw: text,
       }
-      toastNode.textContent = message
-      toastNode.dataset.show = '1'
-      clearTimeout(toastTimer)
-      toastTimer = setTimeout(() => {
-        // `dataset.show = ''` would keep the attribute and keep `[data-show]`
-        // matching, so the toast never faded; remove it instead.
-        if (toastNode !== null) delete toastNode.dataset.show
-      }, holdMs)
+      const byTitle = {}
+      for (const key of Object.keys(BLOCK.fields)) byTitle[BLOCK.fields[key]] = key
+      for (const line of lines.slice(1)) {
+        const at = line.indexOf(': ')
+        if (at <= 0) continue
+        const field = byTitle[line.slice(0, at)]
+        if (field === undefined) continue
+        data[field] = line.slice(at + 2).trim()
+      }
+      if (data.frame !== '') {
+        const arrow = data.frame.indexOf(' → ')
+        if (arrow !== -1) data.frame = data.frame.slice(0, arrow)
+      }
+      return data
     }
 
-    /* ---------------------------------------------------------------- history */
+    /** `label (button.btn)` → `label`; a label that merely ends in parentheses is kept. */
+    function stripDesc(value) {
+      return String(value || '').replace(/\s+\(([A-Za-z][\w.#:()-]*)\)$/u, '') || String(value || '')
+    }
 
-    const RECENT_KEY = 'dsh-element-picker:recent'
-    const RECENT_MAX = 10
+    /** One reference block as the model sees it: this is what the sent-message rule matches. */
+    function sentTextPattern() {
+      const fields = Object.keys(BLOCK.fields).map((key) => BLOCK.fields[key]).join('|')
+      // The marker is optional: quote mode renders the block without [引用元素], and the
+      // block is still recognised by its field lines.
+      return new RegExp('(?:\\[引用(?:元素|链接)\\][^\\n]*|^[^\\n]+(?:\\([^)\\n]*\\))?)(?:\\n(?:' + fields + '):[^\\n]*){2,}', 'gmu')
+    }
+
+    const SENT_PATTERN = sentTextPattern()
+
+    /* --------------------------------------------------------------- recent */
 
     function readRecent() {
       try {
-        const raw = JSON.parse(window.localStorage.getItem(RECENT_KEY) || '[]')
-        return Array.isArray(raw) ? raw.slice(0, RECENT_MAX) : []
+        const list = JSON.parse(window.localStorage.getItem(RECENT_KEY) || '[]')
+        return Array.isArray(list) ? list.slice(0, RECENT_MAX) : []
       } catch (error) {
         return []
       }
     }
 
-    function pushRecent(payload, text) {
+    function pushRecent(payload) {
       try {
-        const entry = {
-          at: Date.now(),
-          label: payload.label || '',
-          kind: payload.kind || 'element',
-          source: payload.source || payload.provider || '',
-          payload,
-          text: text || fieldsOf(payload),
-        }
-        const list = readRecent().filter((item) => item.text !== entry.text)
+        const entry = { at: Date.now(), label: chipLabel(payload), payload }
+        const list = readRecent().filter((item) => formatReference(item.payload) !== formatReference(payload))
         list.unshift(entry)
         window.localStorage.setItem(RECENT_KEY, JSON.stringify(list.slice(0, RECENT_MAX)))
       } catch (error) {
-        /* private mode or quota: history is optional */
+        /* storage is optional */
       }
     }
 
-    function copyText(text) {
-      try {
-        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
-          navigator.clipboard.writeText(text).catch(() => {})
-          return true
+    /* ------------------------------------------------------------- host API */
+
+    async function hostJson(path, body) {
+      const init = body === undefined
+        ? { cache: 'no-store' }
+        : {
+          method: 'POST',
+          cache: 'no-store',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify(body),
         }
-      } catch (error) { /* clipboard unavailable */ }
-      return false
-    }
-
-    function openUrl(url) {
-      const views = Array.from(document.querySelectorAll('webview')).filter(
-        (node) => typeof node.loadURL === 'function',
-      )
-      for (const view of views) {
-        try {
-          view.loadURL(url)
-          toast(translate('openedUrl'))
-          return true
-        } catch (error) { /* guest not ready */ }
-      }
-      copyText(url)
-      toast(translate('copiedUrl'))
-      return true
-    }
-
-    /** Clicking a reference routes by kind: locate, navigate, or copy. */
-    function openPayload(payload) {
-      if (payload === null || typeof payload !== 'object') return false
-      const kind = kindOf(payload.kind)
-      if (kind === 'url' && payload.url) return openUrl(payload.url)
-      if (kind === 'file' && payload.path) {
-        copyText(payload.path)
-        toast(translate('copiedPath'))
-        return true
-      }
-      return flashReference(payload)
-    }
-
-    /* ------------------------------------------------------- sent messages */
-
-    /**
-     * Sent-message side: recognize a reference block in the user's text and render
-     * it as one inline chip instead of its raw lines. Only presentation changes.
-     */
-    const REFERENCE_RULE = {
-      id: 'element',
-      order: 35,
-      match(text, from) {
-        const pattern = /\[引用(元素|网址|文件)\][^\n]*(?:\n(?:选择器|资源|窗口|控件|定位|位置|内容定位|文本区间|页面|框架|文本|链接|路径):[^\n]*)*/gu
-        pattern.lastIndex = from
-        const found = pattern.exec(text)
-        if (found === null) return undefined
-        const raw = found[0]
-        const kind = found[1] === '网址' ? 'url' : found[1] === '文件' ? 'file' : 'element'
-        const lines = raw.split('\n')
-        const label = lines[0].replace(/^\[引用(?:元素|网址|文件)\]\s*/u, '').trim()
-        const data = { kind, label, selector: '', resource: '', page: '', frame: '', text: '', url: '', path: '', raw }
-        const os = { window: '', control: '', locator: '', box: '' }
-        for (const line of lines.slice(1)) {
-          const field = /^(选择器|资源|窗口|控件|定位|位置|内容定位|文本区间|页面|框架|文本|链接|路径):\s*(.*)$/u.exec(line)
-          if (field === null) continue
-          if (field[1] === '选择器') data.selector = field[2]
-          else if (field[1] === '资源') data.resource = field[2]
-          else if (field[1] === '内容定位') data.content = field[2]
-          else if (field[1] === '文本区间') data.textRange = field[2]
-          else if (field[1] === '窗口') os.window = field[2]
-          else if (field[1] === '控件') os.control = field[2]
-          else if (field[1] === '定位') os.locator = field[2]
-          else if (field[1] === '位置') os.box = field[2]
-          else if (field[1] === '页面') data.page = field[2]
-          else if (field[1] === '框架') data.frame = field[2]
-          else if (field[1] === '文本') data.text = field[2]
-          else if (field[1] === '链接') data.url = field[2]
-          else data.path = field[2]
-        }
-        if (os.window !== '' || os.control !== '') data.os = os
-        return { id: 'element', start: found.index, end: found.index + raw.length, data }
-      },
-    }
-
-    function ElementReference(props) {
-      const node = props.node || {}
-      const data = node.data || {}
-      const label = data.label || ''
-      const kind = kindOf(data.kind)
-      const usable =
-        (kind === 'element' && data.selector) || (kind === 'url' && data.url) || (kind === 'file' && data.path)
-      const clickable = props.interactive === true && Boolean(usable)
-      const glyph = KINDS[kind].glyph().replace('width="16" height="16"', 'width="12" height="12"')
-      return React.createElement(
-        'span',
-        {
-          className: 'dsh-ep-chip',
-          title: props.raw || data.raw || label,
-          'data-kind': kind,
-          onClick: clickable ? () => openPayload(data) : undefined,
-        },
-        React.createElement('span', { className: 'dsh-ep-chip-icon', dangerouslySetInnerHTML: { __html: glyph } }),
-        React.createElement('span', { className: 'dsh-ep-chip-label' }, label),
-      )
-    }
-
-    /* -------------------------------------------------------- webview agent */
-
-    const WEBVIEW_AGENT = [
-      '(function () {',
-      '  if (window.__dshEpAgent) return "ready";',
-      '  var state = { active: false, hover: null, picked: null };',
-      '  function cls(el) {',
-      '    var out = [];',
-      '    for (var i = 0; i < el.classList.length; i += 1) {',
-      '      var name = el.classList[i];',
-      '      if (name.indexOf("dsh-ep") !== 0) out.push(name);',
-      '    }',
-      '    return out;',
-      '  }',
-      '  function labelOf(el) {',
-      '    var c = cls(el).slice(0, 3).join(".");',
-      '    return el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + (c ? "." + c : "");',
-      '  }',
-      '  function selectorOf(el) {',
-      '    if (el.id) {',
-      '      try { if (document.querySelectorAll("#" + CSS.escape(el.id)).length === 1) return "#" + CSS.escape(el.id); } catch (e) {}',
-      '    }',
-      '    var path = [];',
-      '    var cur = el;',
-      '    while (cur && cur.nodeType === 1 && cur !== document.documentElement) {',
-      '      var seg = cur.tagName.toLowerCase();',
-      '      if (cur.id) {',
-      '        try {',
-      '          if (document.querySelectorAll("#" + CSS.escape(cur.id)).length === 1) { path.unshift("#" + CSS.escape(cur.id)); break; }',
-      '        } catch (e) {}',
-      '      }',
-      '      var cs = cls(cur).slice(0, 2);',
-      '      for (var i = 0; i < cs.length; i += 1) seg += "." + CSS.escape(cs[i]);',
-      '      var parent = cur.parentElement;',
-      '      if (parent) {',
-      '        var same = [];',
-      '        for (var j = 0; j < parent.children.length; j += 1) { if (parent.children[j].tagName === cur.tagName) same.push(parent.children[j]); }',
-      '        if (same.length > 1) seg += ":nth-of-type(" + (same.indexOf(cur) + 1) + ")";',
-      '      }',
-      '      path.unshift(seg);',
-      '      try { if (document.querySelectorAll(path.join(" > ")).length === 1) break; } catch (e) {}',
-      '      cur = cur.parentElement;',
-      '    }',
-      '    return path.join(" > ");',
-      '  }',
-      '  function textOf(el) {',
-      '    var out = "";',
-      '    for (var i = 0; i < el.childNodes.length; i += 1) { if (el.childNodes[i].nodeType === 3) out += el.childNodes[i].nodeValue; }',
-      '    out = out.replace(/\\s+/g, " ").trim().slice(0, 90);',
-      '    if (!out) out = (el.textContent || "").replace(/\\s+/g, " ").trim().slice(0, 90);',
-      '    return out;',
-      '  }',
-      '  function describe(el) {',
-      '    var r = el.getBoundingClientRect();',
-      '    return { label: labelOf(el), selector: selectorOf(el), text: textOf(el), rect: { x: r.left, y: r.top, w: r.width, h: r.height } };',
-      '  }',
-      '  function detach() {',
-      '    state.active = false;',
-      '    state.hover = null;',
-      '    document.removeEventListener("mousemove", onMove, true);',
-      '    document.removeEventListener("click", onClick, true);',
-      '    document.removeEventListener("keydown", onKey, true);',
-      '    document.removeEventListener("mouseout", onOut, true);',
-      '  }',
-      '  function onMove(e) {',
-      '    if (!state.active) return;',
-      '    var el = e.target;',
-      '    if (!el || el.nodeType !== 1) return;',
-      '    state.hover = describe(el);',
-      '  }',
-      '  function onClick(e) {',
-      '    if (!state.active) return;',
-      '    var el = e.target;',
-      '    if (!el || el.nodeType !== 1) return;',
-      '    e.preventDefault();',
-      '    e.stopPropagation();',
-      '    state.picked = describe(el);',
-      '    detach();',
-      '  }',
-      '  function onKey(e) { if (e.key === "Escape") detach(); }',
-      '  function onOut(e) { if (!e.relatedTarget) state.hover = null; }',
-      '  window.__dshEpAgent = {',
-      '    start: function () {',
-      '      if (state.active) return "started";',
-      '      state.active = true;',
-      '      state.hover = null;',
-      '      state.picked = null;',
-      '      document.addEventListener("mousemove", onMove, true);',
-      '      document.addEventListener("click", onClick, true);',
-      '      document.addEventListener("keydown", onKey, true);',
-      '      document.addEventListener("mouseout", onOut, true);',
-      '      return "started";',
-      '    },',
-      '    stop: function () { detach(); state.picked = null; return "stopped"; },',
-      '    reset: function () { state.picked = null; state.hover = null; return "reset"; },',
-      '    read: function () { return { active: state.active, hover: state.hover, picked: state.picked }; },',
-      '  };',
-      '  return "ready";',
-      '})()',
-    ].join('\n')
-
-    function buildWebviewReference(picked, url) {
-      return fieldsOf({
-        kind: 'element',
-        label: picked.label,
-        selector: picked.selector ? 'webview' + FRAME_SEP + picked.selector : '',
-        page: url || '',
-        text: picked.text || '',
-      })
-    }
-
-    /* --------------------------------------------------------------- picker */
-
-    /** Hover highlight + one-click capture across the top document and same-origin frames. */
-    function createPicker(t) {
-      let box = null
-      let tip = null
-      let active = false
-      let hovered = null
-      let warnTimer = 0
-      let scanTimer = 0
-      const bound = new Map()
-      let viewTimer = 0
-      let viewHover = null
-      let pollBusy = false
-      let lastGuestKey = ''
-      const startedViews = new Set()
-      const attemptAt = new Map()
-
-      function ensureUi() {
-        if (box !== null) return
-        box = document.createElement('div')
-        box.className = 'dsh-ep-box'
-        tip = document.createElement('div')
-        tip.className = 'dsh-ep-tip'
-        document.body.appendChild(box)
-        document.body.appendChild(tip)
-      }
-
-      /** What else this hovered element can be referenced as, so the modifiers are visible. */
-      function hoverExtras(node) {
-        if (isNativeReferenceControl(node)) return [t('hintNative')]
-        const extras = []
-        if (urlOf(node) !== null) extras.push(t('hintLink'))
-        const file = pathOf(node)
-        if (file !== null) extras.push(t('hintFile') + ' ' + file.label.slice(0, 40))
-        return extras
-      }
-
-      function paint(node) {
-        if (node === null) {
-          box.style.display = 'none'
-          if (warnTimer === 0) tip.style.display = 'none'
-          return
-        }
-        const rect = topRect(node)
-        box.style.left = rect.x + 'px'
-        box.style.top = rect.y + 'px'
-        box.style.width = rect.width + 'px'
-        box.style.height = rect.height + 'px'
-        box.style.display = 'block'
-        if (warnTimer !== 0) return
-        const extras = hoverExtras(node)
-        tip.textContent = labelOf(node) + (extras.length > 0 ? '   ' + extras.join('  ') : '')
-        delete tip.dataset.warn
-        tip.style.left = Math.max(6, Math.min(rect.x, window.innerWidth - 320)) + 'px'
-        tip.style.top = Math.max(6, rect.y - 22) + 'px'
-        tip.style.display = 'block'
-      }
-
-      function warn(message) {
-        ensureUi()
-        clearTimeout(warnTimer)
-        warnTimer = setTimeout(() => {
-          warnTimer = 0
-          paint(hovered)
-        }, 1800)
-        tip.textContent = message
-        tip.dataset.warn = '1'
-        tip.style.left = Math.max(6, Math.min(window.innerWidth - 320, box.offsetLeft)) + 'px'
-        tip.style.top = Math.max(6, Number.parseFloat(box.style.top || '0') - 22) + 'px'
-        tip.style.display = 'block'
-      }
-
-      function targetOf(event, doc) {
-        let found = null
-        try {
-          found = doc.elementFromPoint(event.clientX, event.clientY)
-        } catch (error) {
-          found = null
-        }
-        if (found === null || found.nodeType !== 1) return null
-        if (found.closest('.dsh-ep-box') || found.closest('.dsh-ep-tip')) return null
-        if (found.closest('[data-dsh-ep-strip]')) return null
-        return found
-      }
-
-      /**
-       * DSH's own reference affordances (the `@文件` pill in a file row, `@` chips)
-       * already produce the official reference. While picking, let them through
-       * instead of swallowing the click and turning it into an element reference.
-       */
-      function isNativeReferenceControl(node) {
-        const control = node.closest ? node.closest('button, [role="button"]') : null
-        if (control === null) return false
-        const text = (control.textContent || '').trim()
-        return text.startsWith('@') && text.length <= 16
-      }
-
-      function onMove(event, doc) {
-        const next = targetOf(event, doc)
-        if (next !== null && next.tagName === 'WEBVIEW') {
-          hovered = null
-          return
-        }
-        if (next === hovered) return
-        hovered = next
-        paint(next)
-      }
-
-      function onClick(event, doc) {
-        const target = targetOf(event, doc)
-        if (target === null) return
-        if (isNativeReferenceControl(target)) return
-        event.preventDefault()
-        event.stopPropagation()
-        let payload = null
-        try {
-          const wanted = event.altKey ? 'url' : event.shiftKey ? 'file' : 'element'
-          payload = buildPayload(wanted, target, doc === document ? location.href : '')
-        } catch (error) {
-          payload = null
-        }
-        hovered = null
-        stop()
-        if (payload !== null) {
-          const reference = fieldsOf(payload)
-          payload.clipboard = reference
-          if (commitChip(payload)) return
-          // No chip possible: a file still has its native text form.
-          if (payload.kind === 'file' && payload.path && commitReference(mentionOf(payload.path))) return
-          if (commitReference(reference)) return
-        }
-        ensureUi()
-        warn(payload === null ? t('pickFailed') : t('noComposer'))
-      }
-
-      function onKey(event) {
-        if (event.key !== 'Escape' || !active) return
-        event.preventDefault()
-        event.stopPropagation()
-        stop()
-      }
-
-      function bindDocument(doc) {
-        if (bound.has(doc)) return
-        const handlers = {
-          mousemove: (event) => onMove(event, doc),
-          click: (event) => onClick(event, doc),
-          keydown: onKey,
-        }
-        for (const [type, handler] of Object.entries(handlers)) doc.addEventListener(type, handler, true)
-        bound.set(doc, handlers)
-      }
-
-      function scan() {
-        if (!active) return
-        for (const doc of reachableDocuments()) bindDocument(doc)
-      }
-
-      function unbindAll() {
-        for (const [doc, handlers] of bound) {
-          for (const [type, handler] of Object.entries(handlers)) {
-            try {
-              doc.removeEventListener(type, handler, true)
-            } catch (error) { /* frame already gone */ }
-          }
-        }
-        bound.clear()
-      }
-
-      /* ---- electron <webview> guests: cross-origin pages stay pickable ---- */
-
-      function webviewList() {
-        return Array.from(document.querySelectorAll('webview')).filter(
-          (node) => typeof node.executeJavaScript === 'function',
-        )
-      }
-
-      function evalIn(view, code, timeoutMs = 800) {
-        try {
-          const result = view.executeJavaScript(code)
-          const promise = result && typeof result.then === 'function' ? result.catch(() => null) : Promise.resolve(result)
-          return Promise.race([promise, new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs))])
-        } catch (error) {
-          return Promise.resolve(null)
-        }
-      }
-
-      function paintGuest(view, hover) {
-        ensureUi()
-        if (warnTimer !== 0) return
-        let base = null
-        try {
-          base = view.getBoundingClientRect()
-        } catch (error) {
-          base = null
-        }
-        if (base === null) return
-        const x = Math.round(base.left + hover.rect.x)
-        const y = Math.round(base.top + hover.rect.y)
-        const w = Math.round(hover.rect.w)
-        const h = Math.round(hover.rect.h)
-        const key = x + ':' + y + ':' + w + ':' + h + ':' + hover.label
-        if (key === lastGuestKey) return
-        lastGuestKey = key
-        box.style.left = x + 'px'
-        box.style.top = y + 'px'
-        box.style.width = w + 'px'
-        box.style.height = h + 'px'
-        box.style.display = 'block'
-        tip.textContent = hover.label
-        delete tip.dataset.warn
-        tip.style.left = Math.max(6, Math.min(x, window.innerWidth - 320)) + 'px'
-        tip.style.top = Math.max(6, y - 22) + 'px'
-        tip.style.display = 'block'
-      }
-
-      async function pollWebviews() {
-        if (!active || pollBusy) return
-        pollBusy = true
-        try {
-          for (const view of webviewList()) {
-            const snapshot = await evalIn(view, 'window.__dshEpAgent ? window.__dshEpAgent.read() : null', 500)
-
-            if (snapshot === null || typeof snapshot !== 'object') {
-              const now = Date.now()
-              if (now - (attemptAt.get(view) || 0) < 1200) continue
-              attemptAt.set(view, now)
-              const injected = await evalIn(view, WEBVIEW_AGENT, 1500)
-              if (injected === 'ready') {
-                await evalIn(view, 'window.__dshEpAgent.start()', 800)
-                startedViews.add(view)
-              }
-              continue
-            }
-
-            if (snapshot.picked) {
-              const picked = snapshot.picked
-              let url = ''
-              try {
-                url = (typeof view.getURL === 'function' && view.getURL()) || view.getAttribute('src') || ''
-              } catch (error) {
-                url = view.getAttribute('src') || ''
-              }
-              await evalIn(view, 'window.__dshEpAgent && window.__dshEpAgent.reset()', 500)
-              hovered = null
-              viewHover = null
-              lastGuestKey = ''
-              stop()
-              const reference = buildWebviewReference(picked, url)
-              const label = picked.text ? picked.label + ' · ' + picked.text.slice(0, 32) : picked.label
-              const payload = {
-                kind: 'element',
-                label,
-                selector: picked.selector,
-                page: url,
-                text: picked.text,
-                clipboard: reference,
-              }
-              if (!commitChip(payload) && !commitReference(reference)) {
-                ensureUi()
-                warn(t('noComposer'))
-              }
-              return
-            }
-
-            if (snapshot.active === false) {
-              if (!startedViews.has(view)) {
-                await evalIn(view, 'window.__dshEpAgent && window.__dshEpAgent.start()', 800)
-                startedViews.add(view)
-              } else {
-                viewHover = null
-                lastGuestKey = ''
-                stop()
-                return
-              }
-              continue
-            }
-
-            if (snapshot.hover) {
-              viewHover = view
-              paintGuest(view, snapshot.hover)
-              return
-            }
-          }
-
-          if (viewHover !== null) {
-            viewHover = null
-            lastGuestKey = ''
-            paint(null)
-          }
-        } finally {
-          pollBusy = false
-        }
-      }
-
-      function start() {
-        if (active) return
-        try {
-          patchChipDecorate()
-        } catch (error) { /* chips still work through the shipped renderer */ }
-        ensureUi()
-        active = true
-        hovered = null
-        viewHover = null
-        startedViews.clear()
-        tip.textContent = t('hint')
-        delete tip.dataset.warn
-        tip.style.left = '16px'
-        tip.style.top = '16px'
-        tip.style.display = 'block'
-        scan()
-        scanTimer = setInterval(scan, 1000)
-        viewTimer = setInterval(pollWebviews, 150)
-        pollWebviews()
-      }
-
-      function stop() {
-        if (!active) return
-        active = false
-        hovered = null
-        clearInterval(scanTimer)
-        scanTimer = 0
-        clearInterval(viewTimer)
-        viewTimer = 0
-        for (const view of webviewList()) {
-          evalIn(view, 'window.__dshEpAgent && window.__dshEpAgent.stop()')
-        }
-        startedViews.clear()
-        attemptAt.clear()
-        viewHover = null
-        pollBusy = false
-        lastGuestKey = ''
-        unbindAll()
-        if (warnTimer === 0 && tip !== null) tip.style.display = 'none'
-        if (box !== null) box.style.display = 'none'
-      }
-
-      function destroy() {
-        stop()
-        clearTimeout(warnTimer)
-        for (const node of [box, tip]) {
-          if (node !== null && node.parentNode) node.parentNode.removeChild(node)
-        }
-        box = null
-        tip = null
-      }
-
-      return { start, stop, destroy, isActive: () => active }
-    }
-
-    /* ---------------------------------------------------------- strip button */
-
-    /**
-     * The right panel's tab strip has no extension seat, so the icon is inserted
-     * into the same strip chrome, left of the panel's own controls, and re-inserted
-     * whenever React re-renders the strip without it.
-     */
-    function createStripButton(t, picker) {
-      let observer = null
-      let interval = 0
-      let timer = 0
-
-      /** Several session surfaces live in the DOM at once; only one is painted. */
-      function isVisible(node) {
-        if (node === null || node.nodeType !== 1) return false
-        const rect = node.getBoundingClientRect()
-        if (rect.width > 0 && rect.height > 0) return true
-        return node.offsetParent !== null
-      }
-
-      function locate() {
-        const all = Array.from(document.querySelectorAll('button'))
-        const toggles = all.filter((node) => node.hasAttribute('data-sidebar-right-toggle'))
-        const labelled = all.filter((node) => ANCHOR_COLLAPSE.test(node.getAttribute('aria-label') || ''))
-        const candidates = toggles.length > 0 ? toggles : labelled
-        const visible = candidates.filter(isVisible)
-        const toggle = visible.length > 0 ? visible[0] : null
-
-        if (toggle !== null) {
-          const sample = toggle.className || ''
-          let cluster = toggle.parentElement
-          let depth = 0
-          while (cluster !== null && depth < 4 && cluster.querySelector('[data-sidebar-right-mode]') === null) {
-            cluster = cluster.parentElement
-            depth += 1
-          }
-          if (cluster !== null) {
-            const mode = cluster.querySelector('[data-sidebar-right-mode]')
-            let before = mode
-            while (before !== null && before.parentElement !== cluster) before = before.parentElement
-            if (before !== null) return { host: cluster, before, sample }
-            if (cluster.parentElement !== null) return { host: cluster.parentElement, before: cluster, sample }
-          }
-          if (toggle.parentElement !== null) return { host: toggle.parentElement, before: toggle, sample }
-        }
-
-        const split =
-          all.filter((node) => ANCHOR_SPLIT.test(node.getAttribute('aria-label') || '')).filter(isVisible)[0] || null
-        if (split !== null && split.parentElement !== null) {
-          return { host: split.parentElement, before: split.nextSibling, sample: split.className || '' }
-        }
-        return null
-      }
-
-      let hotkey = ''
-
-      function paint() {
-        const button = document.getElementById(BUTTON_ID)
-        if (button === null) return
-        if (picker.isActive()) button.dataset.on = '1'
-        else delete button.dataset.on
-        const base = picker.isActive() ? t('btnOn') : t('btn')
-        const title = hotkey === '' ? base : base + ' · ' + t('osHint').replace('{hotkey}', hotkey)
-        button.title = title
-        button.setAttribute('aria-label', title)
-      }
-
-      function setHotkey(value) {
-        if (typeof value !== 'string' || value === hotkey) return
-        hotkey = value
-        paint()
-      }
-
-      function sync() {
-        timer = 0
-        const place = locate()
-        const existing = document.getElementById(BUTTON_ID)
-
-        if (place === null) {
-          if (existing !== null && existing.parentNode) existing.parentNode.removeChild(existing)
-          return
-        }
-        if (existing !== null && existing.parentNode === place.host) {
-          paint()
-          return
-        }
-        if (existing !== null && existing.parentNode) existing.parentNode.removeChild(existing)
-
-        const button = document.createElement('button')
-        button.type = 'button'
-        button.id = BUTTON_ID
-        button.dataset.dshEpStrip = '1'
-        button.className = place.sample || ''
-        button.innerHTML = ICON
-        button.addEventListener('click', (event) => {
-          event.preventDefault()
-          event.stopPropagation()
-          if (picker.isActive()) {
-            picker.stop()
-          } else {
-            picker.start()
-            // Tell the user the other window path exists without changing the icon.
-            toast(t('osHintToast').replace('{hotkey}', hotkey === '' ? 'Ctrl+Alt+P' : hotkey), 4200)
-          }
-          paint()
-        })
-        button.addEventListener('contextmenu', (event) => {
-          event.preventDefault()
-          event.stopPropagation()
-          showRecent(button)
-        })
-        place.host.insertBefore(button, place.before)
-        paint()
-      }
-
-      /** Right click on the strip icon: re-insert one of the last ten references. */
-      let popup = null
-
-      function closeRecent() {
-        if (popup !== null && popup.parentNode) popup.parentNode.removeChild(popup)
-        popup = null
-      }
-
-      function showRecent(anchor) {
-        if (popup !== null) {
-          closeRecent()
-          return
-        }
-        const list = readRecent()
-        const box = document.createElement('div')
-        box.className = 'dsh-ep-recent'
-        const title = document.createElement('div')
-        title.className = 'dsh-ep-recent-title'
-        title.textContent = t('recent')
-        const clear = document.createElement('button')
-        clear.type = 'button'
-        clear.className = 'dsh-ep-recent-row'
-        clear.style.width = 'auto'
-        clear.textContent = t('recentClear')
-        clear.addEventListener('click', () => {
-          try {
-            window.localStorage.removeItem(RECENT_KEY)
-          } catch (error) { /* ignore */ }
-          closeRecent()
-        })
-        title.appendChild(clear)
-        box.appendChild(title)
-        if (list.length === 0) {
-          const empty = document.createElement('div')
-          empty.className = 'dsh-ep-recent-row'
-          empty.textContent = t('recentEmpty')
-          box.appendChild(empty)
-        }
-        for (const entry of list) {
-          const row = document.createElement('button')
-          row.type = 'button'
-          row.className = 'dsh-ep-recent-row'
-          row.textContent = entry.label || entry.text.split('\n')[0] || t('recentEmpty')
-          row.title = entry.text
-          row.addEventListener('click', () => {
-            closeRecent()
-            if (entry.payload && commitChip(entry.payload)) return
-            commitReference(entry.text)
-          })
-          box.appendChild(row)
-        }
-        const rect = anchor.getBoundingClientRect()
-        box.style.left = Math.max(8, Math.min(window.innerWidth - 300, rect.left - 200)) + 'px'
-        box.style.top = Math.max(8, rect.top - 8 - Math.min(360, 40 + list.length * 28)) + 'px'
-        document.body.appendChild(box)
-        popup = box
-        const dismiss = (event) => {
-          if (popup !== null && !popup.contains(event.target)) {
-            closeRecent()
-            document.removeEventListener('mousedown', dismiss, true)
-          }
-        }
-        document.addEventListener('mousedown', dismiss, true)
-      }
-
-      /**
-       * The strip re-renders on React updates and the document mutates on every
-       * streamed token, so coalesce instead of re-placing the button per animation
-       * frame: at most one placement pass every 200 ms while a reply is streaming.
-       */
-      function schedule() {
-        if (timer !== 0) return
-        timer = setTimeout(() => {
-          timer = 0
-          sync()
-        }, 200)
-      }
-
-      function start() {
-        const boot = () => {
-          sync()
-          observer = new MutationObserver(schedule)
-          if (document.body !== null) observer.observe(document.body, { childList: true, subtree: true })
-          window.addEventListener('resize', schedule)
-          interval = setInterval(schedule, 3000)
-        }
-        if (document.body !== null) boot()
-        else document.addEventListener('DOMContentLoaded', boot, { once: true })
-      }
-
-      function destroy() {
-        if (observer !== null) observer.disconnect()
-        observer = null
-        clearTimeout(timer)
-        timer = 0
-        clearInterval(interval)
-        interval = 0
-        window.removeEventListener('resize', schedule)
-        const existing = document.getElementById(BUTTON_ID)
-        if (existing !== null && existing.parentNode) existing.parentNode.removeChild(existing)
-      }
-
-      return { start, destroy, paint, setHotkey }
+      const response = await fetch(ROUTE + path, init)
+      if (!response.ok) throw new Error('element-ref host ' + response.status)
+      return response.json()
     }
 
     /* ------------------------------------------------------------------ app */
 
     return {
-      inject: ['slots', 'locale', 'inputTriggers', 'uiConversation'],
+      inject: ['slots', 'locale', 'inputTriggers', 'sessions'],
+      __test: {
+        formatReference, chipLabel, clipboardOf, clip, parsePayload, kindOf, parseUserBlock,
+        sentTextPattern, setTextConfig, textConfig,
+        setReferenceStyle: (style) => { referenceStyle = style === 'chip' ? 'chip' : 'quote' },
+        referenceStyle: () => referenceStyle,
+      },
       apply(ctx) {
-        // A hot swap can orphan the previous instance's overlay and leave a guest
-        // agent capturing clicks; clear both before this instance draws anything.
-        for (const stale of Array.from(document.querySelectorAll('.dsh-ep-box, .dsh-ep-tip'))) {
-          if (stale.parentNode) stale.parentNode.removeChild(stale)
+        /** Per-session composer actions, captured from the invisible dock seat. */
+        const bridge = new Map()
+        /** Agent source text, fetched once per page load. */
+        let agentText = ''
+    let agentTextBuild = ''
+        /** Latest host status (browser availability). */
+        let hostStatus = null
+        const state = {
+          armed: false,
+          token: '',
+          since: 0,
+          polling: false,
+          pollTimer: 0,
+          guestTimer: 0,
+          guestBusy: false,
+          seq: 0,
+          guests: new Set(),
         }
-        for (const view of Array.from(document.querySelectorAll('webview'))) {
+
+        let t = (key) => key
+
+        /* ------------------------------------------------------------ toast */
+
+        let toastNode = null
+        let toastTimer = 0
+        /** `holdMs === 0` keeps the message up until hideToast(): the armed banner. */
+        function toast(message, holdMs) {
+          if (toastNode === null || toastNode.parentNode === null) {
+            toastNode = document.createElement('div')
+            toastNode.className = 'dsh-element-ref-toast'
+            document.body.appendChild(toastNode)
+          }
+          toastNode.textContent = message
+          toastNode.dataset.show = '1'
+          clearTimeout(toastTimer)
+          toastTimer = 0
+          if (holdMs === 0) return
+          toastTimer = setTimeout(() => {
+            if (toastNode !== null) delete toastNode.dataset.show
+          }, holdMs || 2200)
+        }
+
+        function hideToast() {
+          clearTimeout(toastTimer)
+          toastTimer = 0
+          if (toastNode !== null) delete toastNode.dataset.show
+        }
+
+        /* --------------------------------------------------- session picking */
+
+        function mainSession() {
+          let listed = null
           try {
-            const result = view.executeJavaScript(
-              'typeof window.__dshEpAgent === "object" ? window.__dshEpAgent.stop() : "none"',
-            )
-            if (result && typeof result.catch === 'function') result.catch(() => {})
-          } catch (error) { /* guest not ready */ }
+            listed = ctx.sessions.list.getSnapshot().byId
+          } catch (error) {
+            listed = null
+          }
+          let best = null
+          for (const [sessionId, entry] of bridge) {
+            if (entry === null || entry === undefined || entry.actions === null) continue
+            const retained = listed && listed[sessionId] && listed[sessionId].retainedBy
+              ? listed[sessionId].retainedBy.mainView
+              : 0
+            if (retained > 0) return { sessionId, actions: entry.actions }
+            if (best === null || entry.at > best.at) best = { sessionId, actions: entry.actions, at: entry.at }
+          }
+          return best
         }
 
-        ctx.effect(() => installStyles(), 'dsh-element-picker: styles')
-        ctx.effect(
-          () =>
-            ctx.locale.register(NS, {
-              zh: {
-                btn: '引用：点一下开始选取（Esc 退出）',
-                btnOn: '引用：选取中，点一下停止',
-                hint: '点元素引用它；⌥ 点取链接、⇧ 点取文件路径；Esc 退出',
-                hintKeys: '点元素引用它 · ↑↓ 切换层级 · Enter 确认 · Ctrl 点选多个 · Esc 退出',
-                multiSelected: '已选 {n} 个 · Enter 合并成一条引用',
-                hintLink: '⌥ 链接',
-                hintFile: '⇧ 文件',
-                hintNative: '官方引用按钮，直接点',
-                sandboxed: '⚠ 沙箱预览，内部取不到',
-                sandboxedHint: '这个预览跑在沙箱里（跨源隔离），先点预览工具栏的「临时解锁」再选',
-                noComposer: '没找到输入框 —— 先点一下输入框再试',
-                pickFailed: '这个元素取不到引用信息',
-                openedUrl: '已在侧栏打开这个链接',
-                copiedUrl: '链接已复制',
-                copiedPath: '路径已复制',
-                recent: '最近引用（右键图标打开）',
-                recentClear: '清空',
-                recentEmpty: '还没有引用过',
-                osPicked: '已引用外部控件：{label}',
-                cdpHint: '浏览器里的元素需要以 --remote-debugging-port=9222 启动（先完全退出浏览器再启动）',
-                osHint: '外部窗口 {hotkey}',
-                osHintToast: '外部窗口元素：按 {hotkey} 进入选取，点一下就会进输入框',
-              },
-              en: {
-                btn: 'Reference: click to start picking (Esc to exit)',
-                btnOn: 'Reference: picking — click to stop',
-                hint: 'Click an element; ⌥-click for its link, ⇧-click for its file path; Esc to exit',
-                hintKeys: 'Click to reference · ↑↓ change level · Enter confirm · Ctrl-click to add · Esc to exit',
-                multiSelected: '{n} selected · Enter to merge into one reference',
-                hintLink: '⌥ link',
-                hintFile: '⇧ file',
-                hintNative: 'Native reference button — click it directly',
-                sandboxed: '⚠ sandboxed preview — its DOM is not reachable',
-                sandboxedHint: 'This preview runs sandboxed (opaque origin). Click “Temporarily disable” in the preview toolbar, then pick again.',
-                noComposer: 'No composer found — click the composer first',
-                pickFailed: 'Could not read this element',
-                openedUrl: 'Opened the link in the sidebar',
-                copiedUrl: 'Link copied',
-                copiedPath: 'Path copied',
-                recent: 'Recent references (right-click the icon)',
-                recentClear: 'Clear',
-                recentEmpty: 'Nothing yet',
-                osPicked: 'Referenced external control: {label}',
-                cdpHint: 'Browser elements need --remote-debugging-port=9222 (quit the browser fully, then relaunch with it)',
-                osHint: 'outside window: {hotkey}',
-                osHintToast: 'Outside DSH: press {hotkey} to pick, click to insert',
-              },
-            }),
-          'dsh-element-picker: dictionaries',
-        )
-        const t = ctx.locale.bind(NS)
-        translate = t
+        /**
+         * Insert one reference chip into the visible composer. This is the
+         * composer's own insert event: it creates the shipped chip node, keeps
+         * the span CAS, undo and the draft projection intact.
+         * @param {object} payload
+         * @returns {{ ok: boolean, reason?: string }}
+         */
+        /**
+         * The composer's quote insertion leaves the caret *before* the new node, so the
+         * next character would land in front of the reference. Walk it past the quote
+         * card with arrow keys, observed through the DOM selection.
+         */
+        function caretAfterQuote() {
+          try {
+            // The quote node is <span data-composer-quote contenteditable="false">: the
+            // selector has to be that attribute, not a made-up one.
+            const quotes = document.querySelectorAll('[data-composer-quote]')
+            const quote = quotes.length > 0 ? quotes[quotes.length - 1] : null
+            if (!quote) return
+            const editable = quote.closest('[contenteditable="true"]') || document.querySelector('[contenteditable="true"]')
+            if (!editable) return
+            editable.focus()
+            const isAfter = () => {
+              const selection = window.getSelection()
+              if (!selection || selection.rangeCount === 0) return false
+              const range = selection.getRangeAt(0)
+              return (quote.compareDocumentPosition(range.startContainer) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0
+            }
+            if (isAfter()) return
+            // Lexical tracks the DOM selection, so placing it right after the quote node
+            // is the direct fix; an arrow key is only the fallback when that is ignored.
+            const range = document.createRange()
+            range.setStartAfter(quote)
+            range.collapse(true)
+            const selection = window.getSelection()
+            if (selection) {
+              selection.removeAllRanges()
+              selection.addRange(range)
+            }
+            if (isAfter()) return
+            editable.dispatchEvent(new KeyboardEvent('keydown', {
+              key: 'ArrowRight', code: 'ArrowRight', keyCode: 39, which: 39, bubbles: true, cancelable: true,
+            }))
+          } catch (error) {
+            /* the caret is cosmetic: never fail the insertion over it */
+          }
+        }
 
-        // Invisible seat in the composer dock: the only way public code reaches the
-        // composer's own `inputActions`.
-        ctx.effect(
-          () =>
-            ctx.slots.inject('conversation.input.dock', () =>
-              ctx.slots.register(
-                { name: 'conversation.input.dock', id: 'element-picker-input-bridge', order: 900 },
-                (props) => {
-                  const actions = props.inputActions || null
-                  React.useEffect(() => {
-                    bridge.actions = actions
-                    return () => {
-                      if (bridge.actions === actions) bridge.actions = null
-                    }
-                  }, [actions])
-                  return null
-                },
-              ),
-            ),
-          'dsh-element-picker: input bridge',
-        )
+        /**
+         * Insert the reference through the best mechanism this DSH build offers, in a
+         * fixed order, so a missing API can never mean "nothing happened":
+         *   1. quote card   (`insertQuote`, 0.2.2 line)
+         *   2. native chip  (`slash/input-insert-reference`)
+         *   3. plain text   (`insertText` on the caret span)
+         *   4. clipboard    (works everywhere; the user pastes it)
+         */
+        function insertReference(payload) {
+          const target = mainSession()
+          if (target === null) return { ok: false, reason: 'no-composer' }
+          const actions = target.actions || {}
+          const text = formatReference(payload).trimEnd()
+          if (text === '') return { ok: false, reason: 'empty' }
 
-        // One owner per chip kind: the slash pipeline asks each owner's codec at
-        // submit time and routes composer chip clicks into openReference.
-        for (const kind of Object.keys(KINDS)) {
-          ctx.effect(
-            () => {
-              try {
-                return ctx.inputTriggers.registerSource({
-                  trigger: '@',
-                  name: KINDS[kind].source,
-                  order: 60 + Object.keys(KINDS).indexOf(kind),
-                  codec: { serialize: (ref) => Promise.resolve(decodeRef(ref)) },
-                  openReference: (session, reference) => openPayload(parsePayload(reference && reference.ref)),
-                })
-              } catch (error) {
-                // A hot swap may race the previous registration's disposal.
-                return () => {}
+          if (referenceStyle === 'quote' && typeof actions.insertQuote === 'function') {
+            let quoted = false
+            try {
+              // DSH's signature is insertQuote(text, summary): the `labels` (remove
+              // button) are filled in by the shell. Passing an object here put it into
+              // `summary`, and the quote card rendered as an empty dark block.
+              quoted = actions.insertQuote(text.replace(/\r\n?/gu, '\n')) === true
+            } catch (error) {
+              quoted = false
+            }
+            if (quoted) {
+              caretAfterQuote()
+              pushRecent(payload)
+              return { ok: true, via: 'quote' }
+            }
+            // Older builds have no quote node: fall through to the other mechanisms.
+          }
+
+          let span = null
+          try {
+            span = typeof actions.captureInsertion === 'function' ? actions.captureInsertion() : null
+          } catch (error) {
+            span = null
+          }
+          if (span !== null) {
+            let actx = null
+            try {
+              actx = ctx.sessions && typeof ctx.sessions.scope === 'function' ? ctx.sessions.scope(target.sessionId) : null
+            } catch (error) {
+              actx = null
+            }
+            if (actx) {
+              const reference = {
+                source: SOURCE,
+                ref: JSON.stringify(payload),
+                label: chipLabel(payload),
+                clipboardText: clipboardOf(payload),
               }
+              let applied = false
+              try {
+                applied = actx.bail(actx, 'slash/input-insert-reference', { reference, span }) === true
+              } catch (error) {
+                applied = false
+              }
+              if (applied) {
+                pushRecent(payload)
+                return { ok: true, via: 'chip' }
+              }
+            }
+            // Plain text keeps the block readable even where chips and quotes are absent.
+            let wrote = false
+            try {
+              wrote = actions.insertText(formatReference(payload, true), span) === true
+            } catch (error) {
+              wrote = false
+            }
+            if (wrote) {
+              pushRecent(payload)
+              return { ok: true, via: 'text' }
+            }
+          }
+          try {
+            void navigator.clipboard.writeText(formatReference(payload, true))
+            pushRecent(payload)
+            return { ok: true, via: 'clipboard' }
+          } catch (error) {
+            return { ok: false, reason: 'no-channel' }
+          }
+        }
+
+        /* ------------------------------------------------------- agent agent */
+
+        async function loadAgentText() {
+          // Cache by build: a Host reload that ships a newer kernel must not be
+          // papered over by the text this page fetched minutes ago.
+          if (agentText !== '' && agentTextBuild !== '' && agentTextBuild === agentBuild) return agentText
+          const response = await fetch(ROUTE + '/agent.js', { cache: 'no-store' })
+          if (!response.ok) throw new Error('agent source unavailable: ' + response.status)
+          agentText = await response.text()
+          if (agentText === '') throw new Error('agent source empty')
+          agentTextBuild = agentBuild
+          return agentText
+        }
+
+        function installInWindow(text) {
+          // Stamp the build so a page holding an older kernel replaces it: without
+          // this, a reloaded plugin keeps serving the previous pickup behaviour.
+          window.__dshRefBuild = agentBuild
+          if (window.__dshRef && window.__dshRef.build === agentBuild) return
+          const run = new Function(text)
+          run()
+          if (!window.__dshRef) throw new Error('agent did not install')
+        }
+
+        function armWindow() {
+          if (!window.__dshRef) return false
+          window.__dshRef.onpick = (payload) => { handlePick(payload, 'dsh') }
+          window.__dshRef.onnotice = (notice) => {
+            if (!notice || notice.at === state.noticeAt) return
+            state.noticeAt = notice.at
+            toast(notice.kind === 'error'
+              ? t('pickFailed', { reason: String(notice.text || '') })
+              : t('nothingHere'), 2600)
+          }
+          window.__dshRef.arm({ channel: 'dsh', omitPage: true, skip: [DSH_SKIP] })
+          return true
+        }
+
+        function disarmWindow() {
+          try {
+            if (window.__dshRef) {
+              window.__dshRef.onpick = null
+              window.__dshRef.disarm()
+            }
+          } catch (error) {
+            /* ignore */
+          }
+        }
+
+        /**
+         * DSH nests parts of its shell inside open shadow roots, and the sidebar
+         * browser is one of them: a top-document query misses the <webview> entirely,
+         * which is exactly "DSH elements pick fine, the built-in browser does not".
+         * The scan is bounded and cached so the 180 ms pick poll stays cheap.
+         */
+        let guestCache = { at: 0, list: [] }
+        /** Self-measurement: the only way to prove whether this plugin costs the UI frames. */
+        const perf = { callbacks: 0, related: 0, syncs: 0, syncMs: 0, scans: 0, evals: 0 }
+        /** Recent guest failures, reported to the Host so the cause is readable outside. */
+        const guestErrors = []
+        /** Per-view install retry clock (a 40 KB eval per 180 ms would be abusive). */
+        const guestAttemptAt = new WeakMap()
+        const GUEST_RETRY_MS = 1200
+        const GUEST_SCAN_MS = 1000
+        const GUEST_SCAN_NODES = 8000
+
+        function deepQuery(selector, out, budgetRef) {
+          const queue = [document]
+          while (queue.length > 0) {
+            const root = queue.shift()
+            if (budgetRef.left <= 0) return
+            let found = []
+            try {
+              found = root.querySelectorAll(selector)
+            } catch (error) {
+              continue
+            }
+            for (const node of found) out.push(node)
+            let all = []
+            try {
+              all = root.querySelectorAll('*')
+            } catch (error) {
+              continue
+            }
+            for (const node of all) {
+              budgetRef.left -= 1
+              if (budgetRef.left <= 0) return
+              if (node.shadowRoot !== null && node.shadowRoot !== undefined) queue.push(node.shadowRoot)
+            }
+          }
+        }
+
+        function guestList() {
+          if (Date.now() - guestCache.at < GUEST_SCAN_MS) return guestCache.list
+          perf.scans += 1
+          const found = []
+          deepQuery('webview[data-sidebar-browser-frame="webview"], webview', found, { left: GUEST_SCAN_NODES })
+          const list = found.filter((node) => typeof node.executeJavaScript === 'function')
+          guestCache = { at: Date.now(), list }
+          return list
+        }
+
+        function evalGuest(view, code, timeoutMs) {
+          perf.evals += 1
+          let result = null
+          try {
+            result = view.executeJavaScript(code)
+          } catch (error) {
+            guestErrors.push('sync: ' + String((error && error.message) || error).slice(0, 160))
+            return Promise.resolve(null)
+          }
+          const promise = result !== null && typeof result.then === 'function'
+            ? result.catch((error) => {
+              guestErrors.push('async: ' + String((error && error.message) || error).slice(0, 160))
+              return null
+            })
+            : Promise.resolve(result)
+          return Promise.race([
+            promise,
+            new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs || 600)),
+          ])
+        }
+
+        /**
+         * Install the kernel into one guest and *verify* it, instead of assuming the
+         * eval worked. The previous version marked every view armed after a silent
+         * failure, so the sidebar browser looked armed while receiving nothing.
+         */
+        async function armGuest(view, text) {
+          const stamp = 'window.__dshRefBuild=' + JSON.stringify(agentBuild) + ';'
+          const installed = await evalGuest(view, 'window.__dshRef ? String(window.__dshRef.build || "") : ""', 400)
+          if (typeof installed === 'string' && installed !== '' && installed === agentBuild) {
+            await evalGuest(view, 'window.__dshRef&&window.__dshRef.arm(' + JSON.stringify({ channel: 'webview', skip: [STRIP_SKIP] }) + ')', 800)
+            state.guests.add(view)
+            return true
+          }
+          if (text !== '') await evalGuest(view, stamp + text + '\n;true', 1400)
+          const after = await evalGuest(view, 'window.__dshRef ? String(window.__dshRef.build || "") : ""', 400)
+          if (typeof after !== 'string' || after === '') return false
+          await evalGuest(view, 'window.__dshRef&&window.__dshRef.arm(' + JSON.stringify({ channel: 'webview', skip: [STRIP_SKIP] }) + ')', 800)
+          state.guests.add(view)
+          return true
+        }
+
+        /**
+         * Report what the renderer actually sees. The DSH window cannot be inspected
+         * from outside, so the client is the only witness: which elements look like a
+         * guest, whether they expose executeJavaScript, and the exact failure text.
+         */
+        async function reportDiagnostics(extra) {
+          const found = []
+          deepQuery('webview, iframe[data-sidebar-browser-frame], iframe[data-html-preview]', found, { left: 4000 })
+          const views = []
+          for (const node of found) {
+            let size = ''
+            try {
+              const rect = node.getBoundingClientRect()
+              size = Math.round(rect.width) + 'x' + Math.round(rect.height)
+            } catch (error) {
+              size = ''
+            }
+            const probe = await evalGuest(node, '1+1', 500)
+            const build = await evalGuest(node, 'String((window.__dshRef && window.__dshRef.build) || "")', 500)
+            const tag = await evalGuest(node, 'String((window.__dshRef && window.__dshRef.version) || "")', 500)
+            views.push({
+              tag: node.tagName.toLowerCase(),
+              frame: node.getAttribute('data-sidebar-browser-frame') || node.getAttribute('data-html-preview') || '',
+              name: String(node.getAttribute('name') || '').slice(0, 24),
+              exec: typeof node.executeJavaScript === 'function',
+              connected: node.isConnected === true,
+              inShadow: typeof node.getRootNode === 'function' ? node.getRootNode() !== document : null,
+              src: String(node.getAttribute('src') || node.getAttribute('data-src') || '').slice(0, 90),
+              size,
+              probe,
+              guestBuild: build,
+              guestVersion: tag,
+            })
+          }
+          void hostJson('/diag', {
+            client: CLIENT_BUILD,
+            build: agentBuild,
+            agentLen: agentText.length,
+            views,
+            total: found.length,
+            errors: guestErrors.slice(-8),
+            armed: extra || null,
+            perf: { callbacks: perf.callbacks, related: perf.related, syncs: perf.syncs, syncMs: Math.round(perf.syncMs * 10) / 10, scans: perf.scans, evals: perf.evals },
+            ua: String(navigator.userAgent || '').slice(0, 140),
+          }).catch(() => {})
+        }
+
+        /**
+         * `executeJavaScript` throws until the guest is attached and its `dom-ready`
+         * has fired ("The WebView must be attached to the DOM…"), so the kernel is
+         * also injected on the guest's own lifecycle events, not just on our timer.
+         */
+        function watchGuest(view) {
+          if (view.__dshRefWatched === true) return
+          view.__dshRefWatched = true
+          const retry = () => { void armGuest(view, agentText) }
+          for (const event of ['dom-ready', 'did-finish-load', 'did-navigate', 'did-navigate-in-page']) {
+            try {
+              view.addEventListener(event, retry)
+            } catch (error) {
+              /* not a webview */
+            }
+          }
+          // The guest document never reports that the pointer left it, but the host
+          // does: the <webview> is a normal element in this document. That is the
+          // presence signal the highlight needs, so no timeout heuristic is involved.
+          const clear = () => {
+            void evalGuest(view, 'window.__dshRef&&window.__dshRef.clearHighlight()', 300)
+          }
+          for (const event of ['mouseleave', 'mouseenter', 'blur']) {
+            try {
+              view.addEventListener(event, clear)
+            } catch (error) {
+              /* not a webview */
+            }
+          }
+        }
+
+        /**
+         * Sample what each guest kernel has actually seen while a session is open:
+         * zero counters means the guest page never delivered a pointer event, while
+         * move>0 and up>0 with no pick means the event path works and describe failed.
+         */
+        async function sampleGuests(delay) {
+          if (!state.armed) return
+          const samples = []
+          for (const view of guestList()) {
+            const raw = await evalGuest(view, 'JSON.stringify(window.__dshRef ? window.__dshRef.read() : null)', 500)
+            let data = null
+            try {
+              data = typeof raw === 'string' && raw !== '' ? JSON.parse(raw) : null
+            } catch (error) {
+              data = null
+            }
+            // A synthetic pointermove answers "does the guest kernel hear anything at
+            // all?" without picking anything (no click is dispatched).
+            const probe = await evalGuest(view, `(function () {
+              try {
+                var api = window.__dshRef
+                if (!api || !api.read) return 'no-kernel'
+                var before = api.read()
+                var el = document.elementFromPoint(120, 120) || document.body || document.documentElement
+                if (!el) return 'no-element'
+                var rect = el.getBoundingClientRect()
+                el.dispatchEvent(new PointerEvent('pointermove', {
+                  bubbles: true, cancelable: true, composed: true, pointerType: 'mouse',
+                  clientX: Math.round(rect.left + 5), clientY: Math.round(rect.top + 5),
+                }))
+                var after = api.read()
+                return JSON.stringify({
+                  hasSeen: Boolean(after && after.seen),
+                  before: (before && before.seen) || null,
+                  after: (after && after.seen) || null,
+                  target: el.tagName,
+                })
+              } catch (error) { return 'error: ' + String((error && error.message) || error) }
+            })()`, 900)
+            samples.push({ armed: state.guests.has(view), data, probe })
+          }
+          if (samples.length === 0) return
+          void hostJson('/diag', { phase: 'sample', delay, samples, errors: guestErrors.slice(-8) }).catch(() => {})
+        }
+
+        async function armGuests(text) {
+          const views = guestList()
+          let armed = 0
+          for (const view of views) {
+            watchGuest(view)
+            if (await armGuest(view, text)) armed += 1
+          }
+          return { found: views.length, armed }
+        }
+
+        /** Window focus is the second presence signal: leaving the app ends the guest box. */
+        function clearGuestHighlights() {
+          for (const view of guestList()) {
+            void evalGuest(view, 'window.__dshRef&&window.__dshRef.clearHighlight()', 300)
+          }
+        }
+
+        function disarmGuests() {
+          for (const view of guestList()) {
+            void evalGuest(view, 'window.__dshRef&&window.__dshRef.disarm()', 400)
+          }
+          state.guests.clear()
+        }
+
+        async function pollGuests() {
+          if (!state.armed || state.guestBusy) return
+          state.guestBusy = true
+          try {
+            for (const view of guestList()) {
+              watchGuest(view)
+              // Reads travel as a JSON string: a structured-clone failure inside
+              // executeJavaScript rejects the whole call, which looks exactly like
+              // "the guest never installed".
+              const raw = await evalGuest(view, 'JSON.stringify(window.__dshRef ? window.__dshRef.read() : null)', 500)
+              let snapshot = null
+              try {
+                snapshot = typeof raw === 'string' && raw !== '' ? JSON.parse(raw) : null
+              } catch (error) {
+                snapshot = null
+              }
+              if (snapshot === null || typeof snapshot !== 'object') {
+                // Not installed yet (or replaced by a stale kernel): install and verify,
+                // but do not hammer a 40 KB injection every 180 ms.
+                if (!state.guests.has(view)) {
+                  const at = guestAttemptAt.get(view) || 0
+                  if (Date.now() - at >= GUEST_RETRY_MS) {
+                    guestAttemptAt.set(view, Date.now())
+                    await armGuest(view, agentText)
+                  }
+                }
+                continue
+              }
+              if (snapshot.picked) {
+                const picked = snapshot.picked
+                void evalGuest(view, 'window.__dshRef&&(window.__dshRef.onpick=null,window.__dshRef.disarm())', 400)
+                state.guests.delete(view)
+                handlePick(picked, 'webview')
+                return
+              }
+              if (snapshot.notice && snapshot.notice.at !== state.noticeAt) {
+                state.noticeAt = snapshot.notice.at
+                toast(t('nothingHere'), 2600)
+              }
+              if (snapshot.active === false) {
+                state.guests.delete(view)
+              }
+            }
+          } finally {
+            state.guestBusy = false
+          }
+        }
+
+        /* ------------------------------------------------------- pick result */
+
+        function stopEverything(reason) {
+          state.seq += 1
+          state.armed = false
+          state.polling = false
+          if (state.pollTimer !== 0) clearTimeout(state.pollTimer)
+          if (state.guestTimer !== 0) clearInterval(state.guestTimer)
+          state.pollTimer = 0
+          state.guestTimer = 0
+          disarmWindow()
+          disarmGuests()
+          const token = state.token
+          state.token = ''
+          if (token !== '') {
+            void hostJson('/disarm', {}).catch(() => {})
+          }
+          paintStrip()
+          hideToast()
+          if (reason === 'user') toast(t('stopped'))
+        }
+
+        function handlePick(result, source) {
+          if (!state.armed) return
+          if (result === null || typeof result !== 'object' || result.cancelled === true) {
+            stopEverything('cancelled')
+            toast(t('cancelled'))
+            return
+          }
+          const payload = { ...result, source: result.source && result.source !== 'page' ? result.source : source }
+          const inserted = insertReference(payload)
+          stopEverything('picked')
+          if (inserted.ok) toast(t('inserted', { label: chipLabel(payload) }))
+          else toast(t('insertFailed'))
+        }
+
+        /* ------------------------------------------------------------ arming */
+
+        async function startArming() {
+          if (state.armed) {
+            stopEverything('user')
+            return
+          }
+          const seq = ++state.seq
+          const alive = () => state.armed && state.seq === seq
+          // Refresh first: the kernel text is cached per build, and a Host reload
+          // must be picked up by the very next arm instead of the next page load.
+          await refreshStatus()
+          let text = ''
+          try {
+            text = await loadAgentText()
+          } catch (error) {
+            toast(t('agentMissing'))
+            return
+          }
+          if (state.seq !== seq) return
+          state.armed = true
+          state.since = 0
+          state.token = ''
+          state.polling = false
+          state.guests.clear()
+          let windowArmed = false
+          try {
+            installInWindow(text)
+            windowArmed = armWindow()
+          } catch (error) {
+            windowArmed = false
+          }
+          let hostBrowsers = []
+          let hostError = ''
+          let extConnected = false
+          try {
+            const result = await hostJson('/arm', {})
+            if (!alive()) return
+            state.token = typeof result.token === 'string' ? result.token : ''
+            hostBrowsers = Array.isArray(result.browsers) ? result.browsers : []
+            extConnected = Boolean(result.extension && result.extension.connected === true)
+            if (state.token !== '') {
+              state.polling = true
+              void pollHost()
+            }
+          } catch (error) {
+            if (!alive()) return
+            hostError = String(error && error.message ? error.message : error)
+          }
+          state.noticeAt = 0
+          let guestCount = 0
+          let guestFound = 0
+          try {
+            const guests = await armGuests(text)
+            guestCount = guests.armed
+            guestFound = guests.found
+          } catch (error) {
+            guestCount = 0
+          }
+          if (!alive()) return
+          if (guestFound > 0) {
+            // Keep polling while a guest exists: a late-loading page or a replaced
+            // kernel gets picked up here instead of failing quietly.
+            state.guestTimer = setInterval(() => { void pollGuests() }, GUEST_POLL_MS)
+          }
+          paintStrip()
+          const armedCount = (windowArmed ? 1 : 0) + guestCount + hostBrowsers.filter((browser) => browser.ok === true).length + (extConnected ? 1 : 0)
+          if (armedCount === 0) {
+            stopEverything('nothing')
+            toast(hostError !== '' ? t('agentMissing') : t('nothingToPick'), 4200)
+            return
+          }
+          // Sticky banner: the armed surfaces stay visible for the whole session, so
+          // clicking a window that is not listed does not feel like a silent failure.
+          toast(armSummary({ windowArmed, guestCount, guestFound, hostBrowsers, hostError, extConnected }), 0)
+          void reportDiagnostics({ guestFound, guestCount, windowArmed, extConnected })
+          if (guestCount > 0) {
+            for (const delay of [1500, 4000, 8000]) setTimeout(() => { void sampleGuests(delay) }, delay)
+          }
+        }
+
+        function armingTargets(options) {
+          const parts = []
+          if (options.windowArmed) parts.push('DSH')
+          if (options.guestCount > 0) parts.push('侧栏网页')
+          else if (options.guestFound > 0) parts.push(t('guestFailed'))
+          for (const browser of options.hostBrowsers) {
+            if (browser.ok === true) parts.push(browser.label)
+          }
+          if (options.extConnected === true) parts.push('浏览器扩展')
+          return parts
+        }
+
+        function armSummary(options) {
+          const targets = armingTargets(options)
+          if (targets.length === 0) return t('nothingToPick')
+          // The kernel id makes "did the page pick up the new build" answerable at a
+          // glance: a stale banner is the reason a fix can look like it did nothing.
+          const build = agentBuild === '' ? '' : ' · v' + String(agentBuild).slice(0, 6)
+          let head = t('armedOn', { targets: targets.join(' / ') }) + build
+          if (options.hostError !== '') return head + ' · ' + t('hostDown')
+          const ready = options.hostBrowsers.filter((browser) => browser.ok === true).length
+          // No browser at all is still "the external channel has no entry": say it instead
+          // of silently listing three of the four surfaces.
+          if (ready === 0) return head + ' · ' + t('someBrowsersOff')
+          const blank = options.hostBrowsers.filter((browser) => browser.ok === true && (browser.targets || []).length === 0)
+          if (blank.length > 0) head += ' · ' + t('openAPage')
+          return head
+        }
+
+        async function pollHost() {
+          if (!state.polling) return
+          let delay = 260
+          try {
+            const result = await hostJson(
+              '/pick?token=' + encodeURIComponent(state.token) + '&since=' + String(state.since),
+            )
+            if (result.state === 'pick' && result.pick) {
+              state.since = typeof result.revision === 'number' ? result.revision : state.since
+              handlePick(result.pick, result.pick.source || 'page')
+              return
+            }
+            if (result.state === 'ended' || result.state === 'replaced') {
+              stopEverything('host-ended')
+              toast(t(result.state === 'replaced' ? 'replaced' : 'expired'))
+              return
+            }
+            if (typeof result.revision === 'number') state.since = Math.max(state.since, result.revision)
+          } catch (error) {
+            delay = 1200
+          }
+          if (state.polling) {
+            state.pollTimer = setTimeout(() => { void pollHost() }, delay)
+          }
+        }
+
+        /* ------------------------------------------------------- strip button */
+
+        function isVisible(node) {
+          if (!node || node.nodeType !== 1) return false
+          const rect = node.getBoundingClientRect()
+          if (rect.width > 0 && rect.height > 0) return true
+          return node.offsetParent !== null
+        }
+
+        function ancestors(node) {
+          const list = []
+          let cur = node
+          for (let depth = 0; cur && depth < 12; depth += 1) {
+            list.push(cur)
+            cur = cur.parentElement
+          }
+          return list
+        }
+
+        /**
+         * Where the icon goes. Two seats, one trigger:
+         *  - expanded: the right sidebar's top-right control cluster, left of the
+         *    fullscreen/collapse controls (shipped `data-sidebar-right-*` attributes,
+         *    with an aria-label fallback for a future build that renames them);
+         *  - collapsed: the conversation header's corner seat, right of the
+         *    "open right sidebar" button, so the trigger exists even while the
+         *    panel is slid off-screen.
+         */
+        function locateStrip() {
+          const firstVisible = (selector) => Array.from(document.querySelectorAll(selector)).filter(isVisible)[0] || null
+          const expanded = document.querySelector('[data-sidebar-right-session][data-sidebar-right-open]') !== null
+          const toggleAttribute = firstVisible('[data-sidebar-right-toggle]')
+          let toggle = toggleAttribute
+          if (toggle === null) {
+            const collapse = /收起右侧边栏|Collapse right sidebar|收起侧边栏|Collapse sidebar/
+            toggle = Array.from(document.querySelectorAll('button')).filter(
+              (node) => isVisible(node) && collapse.test(node.getAttribute('aria-label') || ''),
+            )[0] || null
+          }
+          if (!expanded) {
+            const expand = firstVisible('[data-sidebar-right-expand]')
+            if (expand !== null && expand.parentElement !== null) {
+              return { host: expand.parentElement, before: expand.nextSibling, sample: expand.className }
+            }
+          }
+          if (toggle === null) return null
+          const mode = firstVisible('[data-sidebar-right-mode]')
+          if (mode !== null) {
+            const upMode = ancestors(mode)
+            const upToggle = new Set(ancestors(toggle))
+            for (const candidate of upMode) {
+              if (!upToggle.has(candidate)) continue
+              let child = mode
+              while (child.parentElement && child.parentElement !== candidate) child = child.parentElement
+              if (child.parentElement === candidate) return { host: candidate, before: child, sample: toggle.className }
+            }
+          }
+          if (!toggle.parentElement) return null
+          return { host: toggle.parentElement, before: toggle, sample: toggle.className }
+        }
+
+        function paintStrip() {
+          const button = document.getElementById(BUTTON_ID)
+          if (button === null) return
+          if (state.armed) button.dataset.on = '1'
+          else delete button.dataset.on
+          const label = state.armed ? t('iconOn') : t('iconOff')
+          button.title = label
+          button.setAttribute('aria-label', label)
+        }
+
+        function syncStrip() {
+          const place = locateStrip()
+          const existing = document.getElementById(BUTTON_ID)
+          if (place === null) {
+            if (existing !== null && existing.parentNode) existing.parentNode.removeChild(existing)
+            return
+          }
+          if (existing !== null && existing.parentNode === place.host) {
+            paintStrip()
+            return
+          }
+          if (existing !== null && existing.parentNode) existing.parentNode.removeChild(existing)
+          const button = document.createElement('button')
+          button.type = 'button'
+          button.id = BUTTON_ID
+          button.dataset.elementRefStrip = '1'
+          button.className = place.sample || ''
+          button.innerHTML = ICON
+          button.addEventListener('click', (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            void startArming()
+          })
+          button.addEventListener('contextmenu', (event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            void showMenu(button)
+          })
+          place.host.insertBefore(button, place.before)
+          paintStrip()
+        }
+
+        /* ------------------------------------------------------------- menu */
+
+        let menuNode = null
+        /** The outside-click listener must die with the menu, or every open leaks one. */
+        let menuDismiss = null
+
+        function closeMenu() {
+          if (menuDismiss !== null) {
+            document.removeEventListener('mousedown', menuDismiss, true)
+            menuDismiss = null
+          }
+          if (menuNode !== null && menuNode.parentNode) menuNode.parentNode.removeChild(menuNode)
+          menuNode = null
+        }
+
+        function menuRow(options) {
+          const row = document.createElement(options.action === undefined ? 'div' : 'button')
+          row.className = 'dsh-element-ref-menu-row'
+          if (options.action === undefined) row.dataset.static = '1'
+          else row.type = 'button'
+          const dot = document.createElement('span')
+          dot.className = 'dsh-element-ref-menu-dot'
+          if (options.ok === true) dot.dataset.ok = '1'
+          row.appendChild(dot)
+          const label = document.createElement('span')
+          label.style.flex = '1'
+          label.textContent = options.label
+          row.appendChild(label)
+          if (options.detail) {
+            const detail = document.createElement('span')
+            detail.style.opacity = '0.6'
+            detail.textContent = options.detail
+            row.appendChild(detail)
+          }
+          if (options.action !== undefined) {
+            row.addEventListener('click', (event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              options.action()
+            })
+          }
+          return row
+        }
+
+        async function refreshStatus() {
+          try {
+            hostStatus = await hostJson('/status')
+            applyTextConfig(hostStatus)
+          } catch (error) {
+            hostStatus = null
+          }
+          return hostStatus
+        }
+
+        /** The Host owns the detail/budget knobs; the formatter follows them. */
+        function applyTextConfig(status) {
+          if (status === null || status === undefined || status.config === undefined) return
+          setTextConfig(status.config.textDetail, status.config.textBudget)
+          setReferenceStyle(status.config.referenceStyle)
+          if (typeof status.agentHash === 'string') agentBuild = status.agentHash
+        }
+
+        async function showMenu(anchor) {
+          if (menuNode !== null) {
+            closeMenu()
+            return
+          }
+          await refreshStatus()
+          const box = document.createElement('div')
+          box.className = 'dsh-element-ref-menu'
+          box.dataset.elementRefMenu = '1'
+          const title = document.createElement('div')
+          title.className = 'dsh-element-ref-menu-title'
+          title.textContent = t('menuTargets')
+          box.appendChild(title)
+
+          box.appendChild(menuRow({ label: t('targetDsh'), ok: true, detail: t('alwaysOn') }))
+          if (hostStatus === null) {
+            box.appendChild(menuRow({ label: t('hostDown'), ok: false }))
+          } else {
+            for (const source of hostStatus.sources || []) {
+              if (source.running === true) {
+                box.appendChild(menuRow({ label: source.label, ok: true, detail: source.port ? String(source.port) : '' }))
+              } else if (source.launchable === true) {
+                box.appendChild(menuRow({
+                  label: source.label,
+                  ok: false,
+                  detail: t('launchManagedHint'),
+                  action: async () => {
+                    closeMenu()
+                    toast(t('launching'), 8000)
+                    try {
+                      const result = await hostJson('/launch', {})
+                      toast(result.ok === true ? t('launched') : String(result.reason || t('launchFailed')), 5000)
+                    } catch (error) {
+                      toast(t('launchFailed'), 4000)
+                    }
+                  },
+                }))
+                box.appendChild(menuRow({
+                  label: t('launchUserProfile'),
+                  ok: false,
+                  detail: hostStatus.userProfile && hostStatus.userProfile.running === true
+                    ? t('launchUserRunning')
+                    : t('launchUserHint'),
+                  action: async () => {
+                    closeMenu()
+                    toast(t('launching'), 8000)
+                    try {
+                      const result = await hostJson('/launch', { profile: 'user' })
+                      toast(result.ok === true ? t('launchedUser') : String(result.reason || t('launchFailed')), 7000)
+                    } catch (error) {
+                      toast(t('launchFailed'), 4000)
+                    }
+                  },
+                }))
+              } else {
+                box.appendChild(menuRow({ label: source.label, ok: false, detail: String(source.reason || '') }))
+              }
+            }
+          }
+
+          // The extension bridge is how a browser the user already has gets covered.
+          if (hostStatus !== null && hostStatus.extension !== undefined) {
+            const bridge = hostStatus.extension
+            if (bridge.connected === true) {
+              box.appendChild(menuRow({ label: t('extConnected'), ok: true, detail: String(bridge.port) }))
+            } else if (bridge.enabled !== true || bridge.listening !== true) {
+              box.appendChild(menuRow({ label: t('extDown'), ok: false, detail: String(bridge.error || '') }))
+            } else {
+              box.appendChild(menuRow({
+                label: t('extInstall'),
+                ok: false,
+                detail: t('extInstallHint'),
+                action: async () => {
+                  closeMenu()
+                  const dir = bridge.dir || ''
+                  try {
+                    if (dir !== '') await navigator.clipboard.writeText(dir)
+                  } catch (error) {
+                    /* clipboard may be denied; the steps still name the folder */
+                  }
+                  toast(t('extSteps'), 14000)
+                },
+              }))
+            }
+          }
+
+          const recent = readRecent()
+          const recentTitle = document.createElement('div')
+          recentTitle.className = 'dsh-element-ref-menu-title'
+          recentTitle.textContent = t('menuRecent')
+          box.appendChild(recentTitle)
+          if (recent.length === 0) {
+            box.appendChild(menuRow({ label: t('recentEmpty'), ok: false }))
+          }
+          for (const entry of recent.slice(0, 5)) {
+            box.appendChild(menuRow({
+              label: entry.label,
+              ok: true,
+              detail: new Date(entry.at).toLocaleTimeString(),
+              action: () => {
+                closeMenu()
+                const inserted = insertReference(entry.payload)
+                toast(inserted.ok ? t('inserted', { label: entry.label }) : t('insertFailed'))
+              },
+            }))
+          }
+          box.appendChild(menuRow({
+            label: t('menuClearRecent'),
+            ok: false,
+            action: () => {
+              try {
+                window.localStorage.removeItem(RECENT_KEY)
+              } catch (error) {
+                /* ignore */
+              }
+              closeMenu()
             },
-            'dsh-element-picker: source ' + kind,
+          }))
+
+          const rect = anchor.getBoundingClientRect()
+          box.style.left = Math.max(8, Math.min(window.innerWidth - 280, rect.right - 260)) + 'px'
+          box.style.top = Math.max(8, rect.top - 8 - Math.min(420, 90 + (hostStatus ? (hostStatus.sources || []).length * 26 : 0) + recent.length * 26)) + 'px'
+          document.body.appendChild(box)
+          menuNode = box
+          // closeMenu owns the removal, so closing via the icon, a pick or destroy all
+          // release this listener instead of leaking one per menu open.
+          menuDismiss = (event) => {
+            if (menuNode !== null && !menuNode.contains(event.target)) closeMenu()
+          }
+          document.addEventListener('mousedown', menuDismiss, true)
+        }
+
+        /* ------------------------------------------------------------ flash */
+
+        /**
+         * Point at a reference again. `source` narrows the first try, but the
+         * sent-message renderer only has the model text (which carries no
+         * source), so an unknown source walks the surfaces in cost order.
+         */
+        async function flashPayload(payload) {
+          if (payload === null || payload === undefined) return false
+          const source = payload.source
+          if (source === undefined || source === 'dsh') {
+            try {
+              if (window.__dshRef && window.__dshRef.flash(payload)) return true
+            } catch (error) {
+              /* try the next surface */
+            }
+            if (source === 'dsh') return false
+          }
+          if (source === undefined || source === 'webview') {
+            for (const view of guestList()) {
+              let current = ''
+              try {
+                current = typeof view.getURL === 'function' ? view.getURL() : ''
+              } catch (error) {
+                current = ''
+              }
+              if (current !== '' && payload.page && current !== payload.page) continue
+              const result = await evalGuest(
+                view,
+                'window.__dshRef?window.__dshRef.flash(' + JSON.stringify(payload) + '):false',
+                1200,
+              )
+              if (result === true) return true
+            }
+            if (source === 'webview') return false
+          }
+          try {
+            const result = await hostJson('/flash', { payload })
+            return result.ok === true
+          } catch (error) {
+            return false
+          }
+        }
+
+        /* ------------------------------------------------------------ apply */
+
+        ctx.effect(() => installStyles(), 'element-ref: styles')
+
+        ctx.effect(() => typeof ctx.locale?.register === 'function' ? ctx.locale.register(NS, {
+          zh: {
+            iconOff: '引用：点一下开始选取（Esc 退出）',
+            iconOn: '引用：选取中，点一下停止',
+            stopped: '已停止选取',
+            cancelled: '已取消选取',
+            inserted: '已引用：{label}',
+            insertedText: '已以纯文本引用（此版本无引用卡）：{label}',
+            insertedClipboard: '此版本无法直接插入，已复制引用（Ctrl+V）：{label}',
+            insertFailed: '没找到可插入的输入框 —— 先在会话输入框里点一下再试',
+            agentMissing: '取不到拾取器脚本（宿主插件未启用？）',
+            nothingToPick: '没有可拾取的目标：打开右侧栏网页、Agent 浏览器，或在右键菜单里启动外部浏览器',
+            armedOn: '可选区域：{targets} · 点击元素引用，Esc 退出',
+            hostDown: '宿主插件未响应（仅本机页面可用）',
+            nothingHere: '此处没有可引用的元素（空白或超大容器）',
+            pickFailed: '引用失败：{reason}',
+            someBrowsersOff: '外部浏览器未连接：装扩展，或右键图标 →「点一下开独立窗口」',
+            guestFailed: '侧栏网页：找到 webview 但注入失败',
+            openAPage: '外部浏览器里先打开一个网页',
+            replaced: '另一个窗口开始了新的选取，本次已结束',
+            expired: '选取超时，已结束',
+            launching: '正在启动浏览器（首次较慢）…',
+            launched: '浏览器已启动，再点一次图标即可引用',
+            launchedUser: '已用本机配置启动（调试端口已开），再点图标即可引用',
+            launchFailed: '浏览器启动失败',
+            launchManagedHint: '点一下开独立窗口',
+            launchUserProfile: '用本机 Edge 配置启动',
+            launchUserHint: '用你的登录态（需先退出 Edge）',
+            launchUserRunning: 'Edge 正在运行，先退出它',
+            extConnected: '浏览器扩展：已连接（可拾任何标签页）',
+            extInstall: '浏览器扩展：未安装',
+            extInstallHint: '一次安装后，你日常的 Edge / Chrome 里任何页面都能拾',
+            extSteps: '扩展目录已复制。Edge 打开 edge://extensions → 打开「开发人员模式」→「加载解压缩的扩展」→ 粘贴该目录。装好后重新点图标即可。',
+            extDown: '浏览器扩展端口未监听',
+            menuTargets: '引用目标',
+            menuRecent: '最近引用',
+            menuClearRecent: '清空最近引用',
+            targetDsh: 'DSH 界面',
+            alwaysOn: '始终可用',
+            recentEmpty: '还没有引用过',
+          },
+          en: {
+            iconOff: 'Reference: click to start picking (Esc to exit)',
+            iconOn: 'Reference: picking — click to stop',
+            stopped: 'Picking stopped',
+            cancelled: 'Picking cancelled',
+            inserted: 'Referenced: {label}',
+            insertedText: 'Inserted as plain text (no quote card in this build): {label}',
+            insertedClipboard: 'Copied (this build cannot insert): {label}',
+            insertFailed: 'No composer found — click inside the message box first',
+            agentMissing: 'Picker source unavailable (is the host half enabled?)',
+            nothingToPick: 'Nothing to pick from: open a sidebar page, the agent browser, or launch an external browser from the right-click menu',
+            armedOn: 'Pick from: {targets} · click an element, Esc to exit',
+            hostDown: 'Host half is not responding (local surfaces only)',
+            guestFailed: 'side panel page: webview found but injection failed',
+            nothingHere: 'nothing pickable here (empty area or a scroll container)',
+            pickFailed: 'pick failed: {reason}',
+            someBrowsersOff: 'External browser not connected: install the extension, or right-click the icon → “open a separate window”; the browser you are already using cannot be taken over',
+            openAPage: 'open a page in that browser first',
+            replaced: 'Another window started a new pick; this one ended',
+            expired: 'Pick session expired',
+            launching: 'Starting the browser (slow on first run)…',
+            launched: 'Browser started — click the icon again to pick',
+            launchedUser: 'Started with your own profile (debug port open) — click the icon again to pick',
+            launchFailed: 'Could not start the browser',
+            launchManagedHint: 'click to open a separate window',
+            launchUserProfile: 'Start with your own Edge profile',
+            launchUserHint: 'your logins (quit Edge first)',
+            launchUserRunning: 'Edge is running — quit it first',
+            extConnected: 'Browser extension: connected (any tab)',
+            extInstall: 'Browser extension: not installed',
+            extInstallHint: 'install once and every page in your own Edge / Chrome is pickable',
+            extSteps: 'Extension folder copied. In Edge open edge://extensions → enable Developer mode → Load unpacked → paste that folder. Then click the icon again.',
+            extDown: 'Extension bridge port is not listening',
+            menuTargets: 'Pick targets',
+            menuRecent: 'Recent references',
+            menuClearRecent: 'Clear recent references',
+            targetDsh: 'DSH interface',
+            alwaysOn: 'always available',
+            recentEmpty: 'Nothing yet',
+          },
+        }) : undefined, 'element-ref: dictionaries')
+        // A locale service is not guaranteed on every supported build; a missing binder
+        // must degrade to plain keys, not to a crash on the first toast.
+        t = typeof ctx.locale?.bind === 'function' ? ctx.locale.bind(NS) : (key) => String(key)
+
+        // The only public way to reach the composer's caret: an invisible seat.
+        ctx.effect(
+          () => ctx.slots.inject('conversation.input.dock', () => ctx.slots.register(
+            { name: 'conversation.input.dock', id: 'element-ref-bridge', order: 900 },
+            (props) => {
+              const actions = props.inputActions || null
+              const sessionId = props.sessionId
+              React.useEffect(() => {
+                if (actions === null) return undefined
+                if (typeof sessionId !== 'string' || sessionId === '') return undefined
+                bridge.set(sessionId, { actions, at: Date.now() })
+                return () => {
+                  const current = bridge.get(sessionId)
+                  if (current !== undefined && current.actions === actions) bridge.delete(sessionId)
+                }
+              }, [actions, sessionId])
+              return null
+            },
+          )),
+          'element-ref: composer bridge',
+        )
+
+        /* ------------------------------------------------------ sent messages */
+
+        /**
+         * A submitted reference block renders as the same chip the composer
+         * shows, instead of a wall of lines. Presentation only: the model text
+         * is exactly what `formatReference` produced.
+         */
+        /**
+         * References are quotations, not mentions: a quote mark reads as "this came
+         * from somewhere else", which is exactly what a reference is. DSH's icon set
+         * has no quote glyph (101 keys, none of them a quote), so the chip uses the
+         * typographic mark the same way DSH's own composer marks a reference with `@`.
+         */
+        const CHIP_GLYPH = React.createElement('span', { className: 'dsh-element-ref-chip-mark' }, '❝')
+
+        function SentReference(props) {
+          const data = (props.node && props.node.data) || {}
+          const label = data.label || '引用'
+          const interactive = props.interactive === true && (data.selector !== '' || data.url !== '')
+          const activate = interactive
+            ? (event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              void flashPayload({ ...data, source: data.page !== '' ? undefined : 'dsh' })
+            }
+            : undefined
+          return React.createElement(
+            'span',
+            {
+              className: 'dsh-element-ref-chip',
+              title: props.raw || label,
+              'data-interactive': interactive ? '1' : undefined,
+              onClick: activate,
+            },
+            React.createElement('span', { className: 'dsh-element-ref-chip-glyph', 'aria-hidden': true }, CHIP_GLYPH),
+            React.createElement('span', { className: 'dsh-element-ref-chip-label' }, label),
           )
         }
 
-        // Sent messages: match the block back into a chip instead of raw text.
-        ctx.effect(
-          () => {
-            try {
-              const off = ctx.uiConversation.userText.register(REFERENCE_RULE)
-              return typeof off === 'function' ? off : () => {}
-            } catch (error) {
+        // The reader of `formatReference`, generated from the same block vocabulary.
+        // `uiConversation` is optional for the plugin as a whole (the picker must not
+        // die without it), so it arrives through a scoped injection instead of `inject`.
+        let sentRule = 'pending'
+        ctx.inject(['uiConversation'], (scope) => {
+          scope.effect(() => {
+            const conversation = scope.uiConversation
+            if (conversation === undefined || conversation === null) {
+              sentRule = 'no-service'
               return () => {}
             }
-          },
-          'dsh-element-picker: sent-text rule',
-        )
-        ctx.effect(
-          () =>
-            ctx.slots.inject('conversation.user.text.node', () => {
-              try {
-                return ctx.slots.register(
-                  { name: 'conversation.user.text.node', key: 'element', priority: 100 },
-                  ElementReference,
-                )
-              } catch (error) {
-                return () => {}
-              }
-            }),
-          'dsh-element-picker: sent-text renderer',
-        )
+            try {
+              const off = conversation.userText.register({
+                id: 'element-ref',
+                order: 35,
+                match(text, from) {
+                  // In quote style the reference IS a quote card; decorating it again
+                  // would put our chip inside DSH's own quote preview.
+                  if (referenceStyle !== 'chip') return undefined
+                  SENT_PATTERN.lastIndex = from
+                  const found = SENT_PATTERN.exec(text)
+                  if (found === null) return undefined
+                  const raw = found[0]
+                  return { id: 'element-ref', start: found.index, end: found.index + raw.length, data: parseUserBlock(raw) }
+                },
+              })
+              sentRule = 'registered'
+              return typeof off === 'function' ? off : () => {}
+            } catch (error) {
+              sentRule = 'error: ' + String(error && error.message ? error.message : error).slice(0, 120)
+              return () => {}
+            }
+          }, 'element-ref: sent-text rule')
+        })
 
-        const picker = createPicker(t)
-        const strip = createStripButton(t, picker)
-        ctx.effect(
-          () => () => {
-            strip.destroy()
-            picker.destroy()
-            unpatchChipDecorate()
-          },
-          'dsh-element-picker: teardown',
-        )
-        // Interop hook for addon plugins (model picker and friends): expose the
-        // same insertion path the picker uses internally.
-        window.__dshElementPicker = { commitChip, commitReference }
-        strip.start()
-        patchChipDecorate()
-
-        // The global hotkey runs the SAME picker the strip icon runs, and only while this
-        // window has focus — the native helper defers to us and takes over otherwise.
-        const reportFocus = (focused) => {
-          fetch('/element-picker/os/focus', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ focused }),
-          }).catch(() => {})
-        }
-        const onWindowFocus = () => reportFocus(true)
-        const onWindowBlur = () => reportFocus(false)
-        window.addEventListener('focus', onWindowFocus)
-        window.addEventListener('blur', onWindowBlur)
-        if (document.hasFocus()) reportFocus(true)
-        ctx.effect(
-          () => () => {
-            window.removeEventListener('focus', onWindowFocus)
-            window.removeEventListener('blur', onWindowBlur)
-            reportFocus(false)
-          },
-          'dsh-element-picker: focus reporting',
-        )
-
-        // The hotkey is whatever the host reports; the workspace default is only a
-        // fallback so the first paint works before /state answers.
-        let hotkeySpec = { ctrl: true, alt: true, shift: false, key: 'p' }
-        const parseHotkey = (text) => {
-          const parts = String(text || '')
-            .split('+')
-            .map((part) => part.trim().toLowerCase())
-            .filter(Boolean)
-          if (parts.length === 0) return
-          hotkeySpec = {
-            ctrl: parts.includes('ctrl') || parts.includes('control'),
-            alt: parts.includes('alt'),
-            shift: parts.includes('shift'),
-            key: parts[parts.length - 1],
-          }
-        }
-        const onHotkey = (event) => {
-          const spec = hotkeySpec
-          if (String(event.key).toLowerCase() !== spec.key) return
-          if (Boolean(event.ctrlKey) !== spec.ctrl) return
-          if (Boolean(event.altKey) !== spec.alt) return
-          if (Boolean(event.shiftKey) !== spec.shift) return
-          event.preventDefault()
-          event.stopPropagation()
-          if (picker.isActive()) picker.stop()
-          else picker.start()
-          strip.paint()
-        }
-        window.addEventListener('keydown', onHotkey, true)
-        ctx.effect(
-          () => () => window.removeEventListener('keydown', onHotkey, true),
-          'dsh-element-picker: hotkey',
-        )
-
-        // Elements outside DSH: the native helper posts what sits under the mouse
-        // when the global hotkey fires, and this loop turns it into a chip.
-        let osRevision = 0
-        let osGeneration = ''
-        let osTimer = 0
-        let osBusy = false
-        const pollOsPick = async () => {
-          if (osBusy) return false
-          osBusy = true
+        ctx.effect(() => ctx.slots.inject('conversation.user.text.node', () => {
           try {
-            const response = await fetch('/element-picker/os/state?since=' + String(osRevision), {
-              cache: 'no-store',
-            })
-            if (!response.ok) return
-            const state = await response.json()
-            if (typeof state.hotkey === 'string') parseHotkey(state.hotkey)
-            // The host restarts its revision counter on every mount; a stale local
-            // counter would swallow every new pick.
-            if (typeof state.generation === 'string' && state.generation !== osGeneration) {
-              osGeneration = state.generation
-              osRevision = 0
-              return
-            }
-            // A remount restarts the counter; also catch that from the numbers alone so a
-            // page holding a bigger value still receives new picks.
-            if (typeof state.revision === 'number') {
-              if (state.revision < osRevision) osRevision = 0
-              osRevision = Math.max(osRevision, state.revision)
-            }
-            if (typeof state.hotkey === 'string') strip.setHotkey(state.external === true ? state.hotkey : '')
-            const pick = state.pick
-            if (pick === null || pick === undefined) return
-            // A provider decides the kind; the chip follows it. `file` and `url` picks
-            // reuse the native reference paths already implemented above.
-            if (pick.kind === 'file' && typeof pick.path === 'string' && pick.path !== '') {
-              const fileLabel = String(pick.label || basenameOf(pick.path)).trim().slice(0, 60)
-              const filePayload = { kind: 'file', label: fileLabel, path: pick.path }
-              if (!commitChip(filePayload)) commitReference(mentionOf(pick.path))
-              toast(t('osPicked').replace('{label}', fileLabel))
-              return true
-            }
-            if (pick.kind === 'url' && typeof pick.url === 'string' && pick.url !== '') {
-              const urlLabel = String(pick.label || pick.url).trim().slice(0, 60)
-              const urlPayload = { kind: 'url', label: urlLabel, url: pick.url }
-              if (!commitChip(urlPayload)) commitReference(fieldsOf(urlPayload))
-              toast(t('osPicked').replace('{label}', urlLabel))
-              return true
-            }
-            if (pick.cdp === true || pick.provider === 'browser-cdp' || pick.selector) {
-              // A browser tab answered over the DevTools protocol (or a user provider
-              // returned a real selector): this is a DOM element like an in-app pick.
-              const domLabel = String(pick.label || pick.text || '').trim().slice(0, 60)
-              if (domLabel === '') return
-              const domPayload = {
-                kind: 'element',
-                label: domLabel,
-                selector: String(pick.selector || ''),
-                page: String(pick.page || ''),
-                text: String(pick.text || ''),
-              }
-              if (!commitChip(domPayload)) commitReference(fieldsOf(domPayload))
-              toast(t('osPicked').replace('{label}', domLabel))
-              return true
-            }
-            const control = [pick.controlType, pick.name].filter(Boolean).join(' · ')
-            const label = (pick.windowOnly === true ? pick.windowTitle || control : control || pick.windowTitle || '')
-              .trim()
-              .slice(0, 60)
-            if (label === '') return
-            const payload = {
-              kind: 'element',
-              label,
-              selector: '',
-              page: '',
-              text: pick.text || pick.name || '',
-              os: {
-                window: [pick.processName, pick.windowTitle].filter(Boolean).join(' — ').slice(0, 160),
-                controlType: pick.controlType || '',
-                name: (pick.name || '').slice(0, 120),
-                automationId: pick.automationId || '',
-                className: pick.className || '',
-                bounds: pick.bounds || null,
-                windowOnly: pick.windowOnly === true,
-              },
-            }
-            if (!commitChip(payload)) commitReference(fieldsOf(payload))
-            // A browser window that could not be read means the DevTools port is off;
-            // say so instead of leaving the user with a window-level chip.
-            if (pick.cdpReason) toast(t('cdpHint'), 5000)
-            else toast(t('osPicked').replace('{label}', label))
-            return true
+            return ctx.slots.register(
+              { name: 'conversation.user.text.node', key: 'element-ref', priority: 100 },
+              SentReference,
+            )
           } catch (error) {
-            /* the host half may not be mounted yet */
-          } finally {
-            osBusy = false
+            return () => {}
+          }
+        }), 'element-ref: sent-text renderer')
+
+        // Chip owner: the composer asks this codec at submit time for the model
+        // text of every chip this source produced.
+        ctx.effect(
+          () => ctx.inputTriggers.registerSource({
+            trigger: '@',
+            name: SOURCE,
+            order: 80,
+            showGroupTitle: false,
+            candidates() {
+              return Promise.resolve([])
+            },
+            onPick() {
+              return undefined
+            },
+            codec: {
+              clipboardText: (ref) => clipboardOf(parsePayload(ref)),
+              serialize: (ref) => Promise.resolve(formatReference(parsePayload(ref))),
+            },
+            openReference(session, reference) {
+              const payload = parsePayload(reference && reference.ref)
+              if (payload === null) return false
+              void flashPayload(payload)
+              return true
+            },
+          }),
+          'element-ref: reference source',
+        )
+
+        const strip = {
+          observer: null,
+          timer: 0,
+          start() {
+            syncStrip()
+            // Chat streaming, session rows and toasts mutate the DOM constantly. The
+            // strip only cares about the sidebar anchors and about a guest appearing,
+            // so unrelated mutations must cost nothing (they used to clear the guest
+            // cache and force a whole-document rescan on every tick).
+            this.observer = new MutationObserver((mutations) => {
+              perf.callbacks += 1
+              for (const mutation of mutations) {
+                let related = false
+                for (const node of mutation.addedNodes) {
+                  if (isPickableShell(node)) { related = true; break }
+                }
+                if (!related) {
+                  for (const node of mutation.removedNodes) {
+                    if (isPickableShell(node)) { related = true; break }
+                  }
+                }
+                if (related) {
+                  perf.related += 1
+                  // A panel that opens after the arm click brings its <webview> with it.
+                  guestCache = { at: 0, list: [] }
+                  schedule()
+                  return
+                }
+              }
+            })
+            if (document.body !== null) this.observer.observe(document.body, { childList: true, subtree: true })
+            window.addEventListener('resize', schedule)
+            window.addEventListener('focus', schedule)
+            window.addEventListener('blur', onWindowBlur)
+          },
+          destroy() {
+            if (this.observer !== null) this.observer.disconnect()
+            this.observer = null
+            clearTimeout(this.timer)
+            this.timer = 0
+            window.removeEventListener('resize', schedule)
+            window.removeEventListener('focus', schedule)
+            window.removeEventListener('blur', onWindowBlur)
+            closeMenu()
+            const existing = document.getElementById(BUTTON_ID)
+            if (existing !== null && existing.parentNode) existing.parentNode.removeChild(existing)
+          },
+        }
+
+        /** Window focus loss ends the guest highlight; named so destroy can remove it. */
+        function onWindowBlur() {
+          if (state.armed) clearGuestHighlights()
+        }
+
+        function schedule() {
+          if (strip.timer !== 0) return
+          strip.timer = setTimeout(() => {
+            strip.timer = 0
+            const started = performance.now()
+            syncStrip()
+            perf.syncs += 1
+            perf.syncMs += performance.now() - started
+          }, 200)
+        }
+
+        /** Only these nodes can change what the strip does: sidebar anchors and guests. */
+        const SHELL_SELECTOR = 'webview, [data-sidebar-right-toggle], [data-sidebar-right-mode], [data-sidebar-right-expand]'
+        function isPickableShell(node) {
+          if (!node || node.nodeType !== 1) return false
+          try {
+            if (typeof node.matches === 'function' && node.matches(SHELL_SELECTOR)) return true
+            if (typeof node.querySelector === 'function' && node.querySelector(SHELL_SELECTOR) !== null) return true
+          } catch (error) {
+            return false
           }
           return false
         }
-        // Adaptive polling: brisk right after a pick, lazy when idle, paused-ish when the
-        // window is in the background.
-        let osFastUntil = 0
-        const loopOsPick = async () => {
-          const delivered = await pollOsPick()
-          if (delivered === true) osFastUntil = Date.now() + 5000
-          const delay = document.hidden ? 5000 : Date.now() < osFastUntil ? 700 : 1500
-          osTimer = setTimeout(loopOsPick, delay)
+
+        ctx.effect(() => {
+          strip.start()
+          // Seed the detail/budget knobs from the Host once; they rarely change.
+          void refreshStatus()
+          // Report the guest situation on boot (and once more after the panel has had
+          // time to mount) so the cause is readable from outside without arming.
+          const diagTimers = [2500, 9000].map((delay) => setTimeout(() => {
+            void refreshStatus().then(() => reportDiagnostics({ phase: 'boot' }))
+          }, delay))
+          const perfTimer = setInterval(() => {
+            if (document.visibilityState !== 'visible') return
+            void hostJson('/diag', { phase: 'perf', perf: { callbacks: perf.callbacks, related: perf.related, syncs: perf.syncs, syncMs: Math.round(perf.syncMs * 10) / 10, scans: perf.scans, evals: perf.evals } }).catch(() => {})
+          }, 15000)
+          return () => {
+            for (const timer of diagTimers) clearTimeout(timer)
+            clearInterval(perfTimer)
+            strip.destroy()
+            stopEverything('disposed')
+            if (toastNode !== null && toastNode.parentNode) toastNode.parentNode.removeChild(toastNode)
+            toastNode = null
+          }
+        }, 'element-ref: strip button')
+
+        try {
+          window.__dshElementRef = {
+            arm: () => { void startArming() },
+            disarm: () => { stopEverything('user') },
+            insert: (payload) => insertReference(payload),
+            format: formatReference,
+            /** Support snapshot: which composers are known and which one a pick would target. */
+            debug: () => {
+              const target = mainSession()
+              let mainView = []
+              try {
+                const listed = ctx.sessions.list.getSnapshot().byId || {}
+                mainView = Object.keys(listed).filter((id) => (listed[id].retainedBy?.mainView ?? 0) > 0)
+              } catch (error) {
+                mainView = []
+              }
+              return {
+                armed: state.armed,
+                known: [...bridge.keys()],
+                target: target === null ? null : target.sessionId,
+                mainView,
+                agents: guestList().length,
+                sentRule,
+              }
+            },
+          }
+        } catch (error) {
+          /* a frozen window is not fatal */
         }
-        loopOsPick()
-        ctx.effect(
-          () => () => {
-            clearTimeout(osTimer)
-            osTimer = 0
-          },
-          'dsh-element-picker: OS pick polling',
-        )
+
+        return undefined
       },
     }
   },
 })
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

@@ -1,43 +1,67 @@
 {
-  "name": "dsh-element-picker",
-  "version": "0.10.3",
-  "description": "Reference chips: one strip icon in the right sidebar turns elements, links and file paths into native composer chips — pick from DSH itself, same-origin frames, or the sidebar browser's webview guests; the chips serialize into the prompt and point back at what they name.",
+  "name": "dsh-element-ref",
+  "version": "0.1.0",
+  "description": "Click any element and get a reference into the DSH composer — DSH itself, sidebar browser pages, the DSH agent browser and an external Edge/Chrome all run the same picker kernel.",
   "type": "module",
   "main": "./index.js",
   "exports": {
     ".": "./index.js",
     "./client": "./client.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg",
     "./package.json": "./package.json"
   },
   "files": [
     "index.js",
     "client.js",
     "cdp.js",
-    "protocols.js",
-    "PROTOCOL.md",
-    "README.md",
-    "LICENSE",
-    "scripts/check-pack.mjs",
-    "scripts/e2e.mjs",
+    "browsers.js",
+    "agent.source.js",
     "cordis.patch.yml",
-    "native/os-pick.ps1"
+    "locale/*.json",
+    "docs/DESIGN.md",
+    "LICENSE",
+    "NOTICE",
+    "icon.svg",
+    "extension",
+    "README.md"
   ],
+  "engines": {
+    "node": ">=20"
+  },
   "dsh": {
     "manifestVersion": 1,
+    "engines": {
+      "dsh": ">=0.2.1-rc.1 <0.3.0-0"
+    },
     "bundle": {
       "patch": "./cordis.patch.yml"
     },
     "client": {
       "platform": "web",
+      "immediately": true,
       "inject": [
         "@deepseek-ai/dsh-client-ui-conversation"
       ]
     }
   },
   "scripts": {
-    "prepublishOnly": "node scripts/check-pack.mjs",
-    "e2e": "node scripts/e2e.mjs"
+    "test": "node scripts/test.mjs",
+    "check:pack": "node scripts/check-pack.mjs",
+    "prepublishOnly": "node scripts/test.mjs && node scripts/check-pack.mjs"
   },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "cordis",
+    "deepseek-harness",
+    "element-picker",
+    "reference"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/sakikoTGW/dsh-element-picker.git"
@@ -46,14 +70,5 @@
   "bugs": {
     "url": "https://github.com/sakikoTGW/dsh-element-picker/issues"
   },
-  "author": "sakikoTGW",
-  "license": "MIT",
-  "keywords": [
-    "dsh",
-    "dsh-plugin",
-    "cordis",
-    "deepseek-harness",
-    "element-picker",
-    "reference-chip"
-  ]
+  "author": "Knot-chord"
 }

@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Element reference",
+    "description": "One icon at the top right of the right sidebar (or beside the open-sidebar button while that sidebar is collapsed) starts picking: click an element in DSH, in a sidebar browser page (Desktop), in the DSH agent browser, or in an external Edge/Chrome window, and a native reference chip is inserted into the composer with a compact description of what you pointed at. Left-click the icon to start or stop (Esc also stops); right-click it for available targets and recent references. Picking outside DSH uses the Chrome DevTools Protocol: the agent browser is found through dsh-ego-browser's state file, an existing browser window started with --remote-debugging-port is attached to, and otherwise this plugin can launch a browser with its own persistent profile. Limitations: an element inside a closed shadow root cannot be read; a cross-origin iframe inside a sidebar page is referenced as the frame element; the sidebar browser is a webview only in the Desktop app, so the Web GUI cannot pick inside it. With the plugin disabled nothing is injected, no debugging port is opened and no external browser is started."
+  }
+}

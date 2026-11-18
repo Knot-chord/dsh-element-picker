@@ -1,7 +1,9 @@
-# runtime helper state (held open while the picker runs)
-os-pick.lock
-
-# dependencies / scratch
 node_modules/
+# version-compat sandbox (isolated DSH_HOME + npm cache)
+.compat/
+.dsh-trash/
 *.log
-.DS_Store
+# release assets (built by npm pack, attached to a GitHub release)
+dist/
+.install-staging/
+*.tgz
