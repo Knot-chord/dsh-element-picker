@@ -10,27 +10,6 @@ DeepSeek Harness 插件：**点一下，就能引用一个元素**——DSH 自�
 
 > 上游：[dsh-element-picker](https://www.npmjs.com/package/dsh-element-picker)（作者 **sakikoTGW**，MIT）。本实现是同一问题域的独立重写，上游先行，credit 归他；详见 [NOTICE](NOTICE)。
 
-## 三个地方，三个用途
-
-这个项目涉及三份文件，**不要混**：
-
-| 地方 | 路径 | 用途 | 谁写谁读 |
-| --- | --- | --- | --- |
-| **开发版** | 本仓库（根目录） | 改代码、跑测试、打包 | 你写；`npm pack` 读 |
-| **载入版** | `DSH 根目录/dsh-workspace/plugins/element-ref/` | DSH 真正加载的那份，只含包内文件 | `scripts/sync-installed.mjs` 从开发版同步；desktop profile 指向它 |
-| **沙箱** | `DSH 根目录/dsh-workspace/compat/` | 兼容性测试（复用现有的 `dsh-home` + `npm-cache`） | `scripts/compat.ps1` 把**开发版**以 `link:` 装进 `compat` profile 后逐版本验证 |
-
-两条同步关系：
-
-```
-开发版 ──node scripts/sync-installed.mjs --apply──▶ 载入版 ──desktop profile link──▶ DSH 加载
-   └──────────────node scripts/compat.ps1──────────────▶ 沙箱（link 到开发版，验证行为）
-```
-
-- 载入版里永远**只有** `npm pack` 出来的运行时文件（22 个），不会带 `scripts/`、`dist/`、`.compat/`；
-- `node scripts/check-pack.mjs` 同时核对：包内文件齐全 + 开发版与载入版逐字节一致；
-- 沙箱只保留**两个代表版本**（0.2.0-rc.2、0.2.1-rc.5），不按版本新建沙箱目录；
-- 三处都用 `node scripts/state.mjs` 一眼看全。
 ## 痛点
 
 描述界面元素很费劲："右边那个蓝色的按钮""标题下面第二行""就是你刚点的那个"。
