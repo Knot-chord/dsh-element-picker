@@ -2,7 +2,7 @@
   compat.ps1 — 在隔离沙盒里验证本插件能被指定版本的 DSH 接受并挂载。
 
   用法：
-    pwsh -File scripts/compat.ps1                      # 默认跑 0.2.1-rc.5 .. 0.2.2-rc.3
+    pwsh -File scripts/compat.ps1                      # 默认跑两个边界版本 0.2.0-rc.2 / 0.2.1-rc.5
     pwsh -File scripts/compat.ps1 -Versions 0.2.0-rc.2 # 探更低的版本
     pwsh -File scripts/compat.ps1 -Fresh               # 重建每个版本的沙盒
 

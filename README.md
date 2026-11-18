@@ -41,9 +41,11 @@ DeepSeek Harness 插件：**点一下，就能引用一个元素**——DSH 自�
 ## 安装
 
 ```sh
-# GitHub
-dsh plugin --profile desktop add github:Knot-chord/dsh-element-ref
-dsh plugin --profile desktop add "github:Knot-chord/dsh-element-ref#v0.1.0"   # 锁版本
+# GitHub（PR 合并前，用当前分支）
+dsh plugin --profile desktop add github:Knot-chord/dsh-element-picker#feat/replace-with-pro
+
+# GitHub（PR 合并后）
+dsh plugin --profile desktop add github:sakikoTGW/dsh-element-picker
 
 # npm（发布后）
 dsh plugin --profile desktop add dsh-element-ref
@@ -172,8 +174,10 @@ chip 态（`referenceStyle: chip`）才带 `[引用元素]` 首行标记。
 
 功能分界点是 `insertQuote`，它在 **0.2.2-rc.1** 才出现。所以 0.2.1 上引用走第二条路，属于设计内降级。
 
+> 沙箱里保留的是两个**边界探针**：`0.2.0-rc.2`（0.2.x 起点，不承诺支持）和 `0.2.1-rc.5`（`insertQuote` 出现前最后一个版本）；当前桌面端 `0.2.2-rc.3` 用真机验证，不占沙箱。
+
 - 扩展：`minimum_chrome_version = "120"`（`chrome.alarms` 的 0.5 分钟周期需要），本机 Edge 157 实测。
-- 版本之间确实变过东西：0.2.2-rc.2 调过浮层定位接口、工具错误分类与 Session 批量追加。本插件不使用这些接口；升级 DSH 后先跑一遍「装完先验三件事」。
+- 版本之间确实变过东西：0.2.2-rc.2 调过浮层定位接口、工具错误分类与 Session 批量追加。本插件不使用这些接口；升级 DSH 后先跑一遍「装完先验四件事」。
 
 设计与验证细节见 [docs/DESIGN.md](docs/DESIGN.md)。
 
@@ -212,13 +216,13 @@ node scripts/check-pack.mjs    # 发布纯净性：包里只有运行时文件�
 沙箱（隔离 `DSH_HOME`，放在 `D:\Deepseek Hardness\dsh-workspace\compat\element-ref\`）：
 
 ```powershell
-node scripts/compat.ps1           # 在共享沙箱里验证两个代表版本（本地 bin + link: 安装，秒级）
+node scripts/compat.ps1           # 在共享沙箱里验证两个边界版本（缓存 DSH 的 lib/bin.js 直跑 + 插件 link: 安装，秒级）
 node scripts/verify-sandbox.mjs   # 共享沙箱体检（profile + 两个版本，14 项）
 node scripts/compat-web.mjs 0.2.2-rc.3   # 浏览器级：起 dsh web + 无头 Edge 验客户端与图标
-node scripts/state.mjs            # 三个地方一次看全：开发版 / 载入版 / 沙箱
+node scripts/state.mjs            # 开发版 / 载入版 / 沙箱一次看全
 ```
 
-沙箱里插件用 `link:` 安装（不是副本），安装用本地 `lib/bin.js`（不联网）；共享沙箱里只留两个代表版本（0.2.0-rc.2、0.2.1-rc.5）。
+沙箱里插件用 `link:` 安装（不是副本）；DSH 用缓存包里的 `lib/bin.js` 直接运行（不联网）。共享沙箱只留两个**边界版本**：`0.2.0-rc.2`（0.2.x 起点，不承诺支持）和 `0.2.1-rc.5`（`insertQuote` 出现前最后一个版本）。
 
 ## License
 
