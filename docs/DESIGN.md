@@ -293,10 +293,10 @@ dsh-element-ref/
 支持的版本写在 `package.json` 的 `dsh.engines.dsh`：`>=0.2.1-rc.1 <0.3.0-0`（下限是实测能装能挂的最低版本；0.2.1 与 0.2.2 全 rc 逐版 PASS）。
 功能分界：`insertQuote`（原生引用卡）由 0.2.2-rc.1 引入；0.2.1 及更早自动降级为 chip/纯文本，并在提示里说明用了哪条通道。
 
-验证用 `scripts/compat.ps1` + `scripts/verify-sandbox.mjs`（沙箱完整性）+ `scripts/compat-web.mjs`（浏览器级）：在 `D:\Deepseek Hardness\dsh-workspace\compat`（可用 `DSH_REF_COMPAT` 覆盖）的共享沙箱里，优先用已缓存 DSH 的 `lib/bin.js` 直跑，缓存缺失时回退到 `npx`；逐个版本装本插件、生成配置，输出矩阵。
+验证用 `scripts/compat.ps1` + `scripts/verify-sandbox.mjs`（沙箱完整性）+ `scripts/compat-web.mjs`（浏览器级）：在 `D:\dsh_data\sandbox\compat`（可用 `DSH_REF_COMPAT` 覆盖）的共享沙箱里，优先用已缓存 DSH 的 `lib/bin.js` 直跑，缓存缺失时回退到 `npx`；逐个版本装本插件、生成配置，输出矩阵。
 
 ```powershell
-pwsh -File scripts/compat.ps1                              # 默认两个边界版本：0.2.0-rc.2 / 0.2.1-rc.5
+pwsh -File scripts/compat.ps1                              # 默认四个版本：0.2.0-rc.2 / 0.2.1-rc.5 / 0.2.2-rc.4 / 0.2.2-rc.5
 pwsh -File scripts/compat.ps1 -Versions 0.2.0-rc.2         # 探更低的版本
 pwsh -File scripts/compat.ps1 -Fresh                       # 重建沙盒
 ```
@@ -317,3 +317,4 @@ compat 矩阵验证的是「宿主能装、能挂、配置能生成、插件行�
 
 关系：`开发版 --sync-installed--> 载入版 --profile link--> DSH 加载`；`开发版 --compat.ps1(link 安装)--> 沙箱`。
 `scripts/check-pack.mjs` 同时核对「包内文件齐全」与「开发版 == 载入版逐字节一致」；`scripts/state.mjs` 一次打印三处现状。
+

@@ -3,7 +3,7 @@
  *
  *   node scripts/verify-sandbox.mjs
  *
- * 沙箱只有一处：D:\Deepseek Hardness\dsh-workspace\compat
+ * 沙箱只有一处：D:\dsh_data\sandbox\compat
  *   compat\dsh-home\            —— 唯一 DSH_HOME（profile: compat）
  *   compat\npm-cache\_npx\*\    —— 已装的 DSH 版本（复用，不新建）
  *
@@ -88,3 +88,4 @@ console.log('\n== 汇总 ==')
 console.log('  ' + versions.length + ' 个版本 | 检查项 ' + results.length + ' | 失败 ' + failed.length)
 for (const entry of failed) console.log('  FAIL ' + entry.item + ' — ' + entry.detail)
 process.exit(failed.length === 0 ? 0 : 1)
+

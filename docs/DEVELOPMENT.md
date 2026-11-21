@@ -11,7 +11,7 @@ node scripts/check-pack.mjs    # 发布纯净性：包里只有运行时文件�
 
 ## 共享沙箱
 
-沙箱（隔离 `DSH_HOME`，放在 `D:\Deepseek Hardness\dsh-workspace\compat\element-ref\`）：
+沙箱（隔离 `DSH_HOME`，放在 `D:\dsh_data\sandbox\compat\versions\0.2.2-rc.5\dsh-home\`）：
 
 ```powershell
 node scripts/compat.ps1           # 在共享沙箱里验证两个边界版本（缓存 DSH 的 lib/bin.js 直跑 + 插件 link: 安装，秒级）
@@ -23,6 +23,9 @@ node scripts/state.mjs            # 开发版 / 载入版 / 沙箱一次看全
 沙箱里插件用 `link:` 安装（不是副本）；DSH 用缓存包里的 `lib/bin.js` 直接运行（不联网）。共享沙箱只留两个**边界版本**：
 
 - `0.2.0-rc.2`：0.2.x 起点，用来探下限，**不承诺支持**；
-- `0.2.1-rc.5`：`insertQuote` 出现前最后一个版本。
+- `0.2.1-rc.5`：`insertQuote` 出现前最后一个版本；
+- `0.2.2-rc.4`：升级前基线；
+- `0.2.2-rc.5`：当前桌面端，最新 `next`。
 
-当前桌面端 `0.2.2-rc.3` 用真机验证，不占沙箱。
+当前桌面端 `0.2.2-rc.5` 用真机验证，同时保留在沙箱。
+
